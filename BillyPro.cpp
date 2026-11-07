@@ -9005,7 +9005,7 @@ static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_SHOWWINDOW: {
         // Page just became visible: reset scroll and fit the scrollbar to content
-        if (wParam) {
+        if (wp) {
             int oldy = GetScrollPos(hwnd, SB_VERT);
             if (oldy) {
                 ScrollWindowEx(hwnd, 0, oldy, NULL, NULL, NULL, NULL,
@@ -9032,7 +9032,7 @@ static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SCROLLINFO si = { sizeof(si), SIF_ALL };
         GetScrollInfo(hwnd, SB_VERT, &si);
         int oldy = si.nPos;
-        switch (LOWORD(wParam)) {
+        switch (LOWORD(wp)) {
         case SB_TOP:      si.nPos = 0; break;
         case SB_BOTTOM:   si.nPos = si.nMax; break;
         case SB_LINEUP:   si.nPos -= 24; break;
@@ -9051,7 +9051,7 @@ static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     case WM_MOUSEWHEEL: {
-        int wdelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        int wdelta = GET_WHEEL_DELTA_WPARAM(wp);
         SCROLLINFO si = { sizeof(si), SIF_ALL };
         GetScrollInfo(hwnd, SB_VERT, &si);
         if (si.nMax > 0) {
@@ -11195,7 +11195,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE: {
         g_hwnd = hwnd;
-        srand(GetTickCount64());
+        srand(static_cast<unsigned int>(GetTickCount64()));
         CreateFonts();
         ApplyTheme();
 
