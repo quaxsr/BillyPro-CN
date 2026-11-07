@@ -27,7 +27,7 @@ jobs:
           cmake_minimum_required(VERSION 3.10)
           project(dcadec C)
           file(GLOB SRCS "libdcadec/*.c")
-          add_library(dcadec STATIC `${SRCS})
+          add_library(dcadec STATIC $SRCS)
           target_include_directories(dcadec PUBLIC libdcadec)
           target_compile_definitions(dcadec PRIVATE _USE_MATH_DEFINES)
           "@
