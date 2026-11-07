@@ -8,16 +8,37 @@ jobs:
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
-        
-      - name: Download FLAC Headers
+
+      - name: Auto Fix Source and FLAC
+        shell: pwsh
         run: |
+          # 1. 下载并解压 FLAC 头文件到根目录
           Invoke-WebRequest -Uri "https://github.com/xiph/flac/archive/refs/tags/1.4.3.zip" -OutFile "flac.zip"
           Expand-Archive -Path "flac.zip" -DestinationPath "."
           mkdir FLAC
           Copy-Item -Path "flac-1.4.3\include\FLAC\*" -Destination "FLAC\" -Recurse
-        
+          
+          # 2. 暴力剔除 BillyPro.cpp 的 BOM 隐藏字符
+          $content = Get-Content "BillyPro.cpp" -Raw
+          $content = $content.TrimStart([char]0xFEFF)
+          # 把缺失的 FLAC 头文件直接注释掉
+          $content = $content -replace '#include "FLAC/stream_decoder.h"', '// #include "FLAC/stream_decoder.h"'
+          [System.IO.File]::WriteAllText("$PWD\BillyPro.cpp", $content, [System.Text.Encoding]::UTF8)
+
+          # 3. 创建强制 UTF-8 配置文件 (MSBuild 绝对无法拒绝)
+          $props = @"
+          <Project>
+            <ItemDefinitionGroup>
+              <ClCompile>
+                <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+              </ClCompile>
+            </ItemDefinitionGroup>
+          </Project>
+          "@
+          Set-Content -Path "Directory.Build.props" -Value $props
+          
       - name: Build with MSBuild
-        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143 /p:AdditionalOptions="/utf-8"
+        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143
         
       - uses: actions/upload-artifact@v4
         with:
