@@ -23,14 +23,14 @@ jobs:
           cd ..
           
           # 3. 给 dcadec 注入数学宏并编译
-          Set-Content -Path "dca_src/CMakeLists.txt" -Value @"
+          Set-Content -Path "dca_src/CMakeLists.txt" -Value @'
           cmake_minimum_required(VERSION 3.10)
           project(dcadec C)
           file(GLOB SRCS "libdcadec/*.c")
-          add_library(dcadec STATIC $SRCS)
+          add_library(dcadec STATIC ${SRCS})
           target_include_directories(dcadec PUBLIC libdcadec)
           target_compile_definitions(dcadec PRIVATE _USE_MATH_DEFINES)
-          "@
+          '@
           cd dca_src
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
