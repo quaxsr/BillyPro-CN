@@ -8,39 +8,51 @@ jobs:
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
-        
-      - name: Install FLAC library via vcpkg
-        run: vcpkg install flac:x64-windows
-        
-      - name: Auto Fix Source and Include Paths
+
+      - name: Fetch and Compile Dependencies (FLAC & dcadec)
         shell: pwsh
         run: |
-          # 1. 解压 dcadec_src.zip
-          if (Test-Path "dcadec_src.zip") {
-            Expand-Archive -Path "dcadec_src.zip" -DestinationPath "." -Force
-          }
+          # 1. 克隆 FLAC 和 dcadec 源码
+          git clone https://github.com/xiph/flac.git flac_src --depth 1 --branch 1.4.3
+          git clone https://github.com/foo86/dcadec.git dca_src --depth 1
           
-          # 2. 暴力清理 BillyPro.cpp 的 BOM 隐藏字符
+          # 2. 用 CMake 编译 FLAC (静态库)
+          cd flac_src
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DWITH_OGG=OFF
+          cmake --build build --config Release
+          cd ..
+          
+          # 3. 用 CMake 编译 dcadec (静态库)
+          cd dca_src
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          cd ..
+          
+          # 4. 创建我们自己的依赖文件夹
+          New-Item -ItemType Directory -Force -Path include/FLAC
+          New-Item -ItemType Directory -Force -Path lib
+          
+          # 5. 把 FLAC 的头文件和编译出的 lib 复制过去
+          Copy-Item -Path flac_src/include/FLAC/* -Destination include/FLAC/ -Force
+          Copy-Item -Path flac_src/build/src/lib/Release/libFLAC.lib -Destination lib/ -ErrorAction SilentlyContinue
+          # 兼容不同版本可能生成的名字
+          Copy-Item -Path flac_src/build/src/lib/Release/FLAC.lib -Destination lib/ -ErrorAction SilentlyContinue
+          
+          # 6. 把 dcadec 的头文件和编译出的 lib 复制过去
+          Copy-Item -Path dca_src/libdcadec/dca_context.h -Destination ./ -Force
+          Copy-Item -Path dca_src/libdcadec/dca_frame.h -Destination ./ -Force
+          Copy-Item -Path dca_src/build/Release/dcadec.lib -Destination lib/ -ErrorAction SilentlyContinue
+          
+          # 7. 清理 BillyPro.cpp 源码里自带的无形 BOM 乱码
           $content = Get-Content "BillyPro.cpp" -Raw
           $content = $content.TrimStart([char]0xFEFF)
           [System.IO.File]::WriteAllText("$PWD\BillyPro.cpp", $content, [System.Text.Encoding]::UTF8)
 
-          # 3. 创建配置文件，强行把所有路径、FLAC库和 UTF-8 灌给编译器
-          $props = @"
-          <Project>
-            <ItemDefinitionGroup>
-              <ClCompile>
-                <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-                <AdditionalIncludeDirectories>`$(pwd);`$(pwd)\dcadec_src\libdcadec;`$(pwd)\dcadec_src\msvc;C:\vcpkg\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-              </ClCompile>
-              <Link>
-                <AdditionalLibraryDirectories>C:\vcpkg\installed\x64-windows\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-                <AdditionalDependencies>libFLAC.lib;%(AdditionalDependencies)</AdditionalDependencies>
-              </Link>
-            </ItemDefinitionGroup>
-          </Project>
-          "@
-          Set-Content -Path "Directory.Build.props" -Value $props
-          
-      - name: Build with MSBuild
-        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143
+      - name: Build BillyPro
+        # 强行让编译器去我们刚才准备好的 include 和 lib 文件夹里找文件
+        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143 /p:AdditionalIncludeDirectories="${{ github.workspace }}\include" /p:AdditionalDependencies="libFLAC.lib;dcadec.lib;%(AdditionalDependencies)" /p:AdditionalLibraryDirectories="${{ github.workspace }}\lib"
+        
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BillyPro-x64
+          path: x64\Release\BillyPro.exe
