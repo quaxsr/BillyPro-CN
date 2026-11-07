@@ -1,0 +1,18 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+      
+      - name: Build with MSBuild
+        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143
+        
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BillyPro-x64
+          path: x64\Release\BillyPro.exe
