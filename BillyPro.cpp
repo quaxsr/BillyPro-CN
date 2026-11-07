@@ -1,6 +1,9 @@
-#pragma execution_character_set("utf-8")
-#ifndef UNICODE
-#define UNICODE
+﻿﻿// BillyPro.cpp  -  Win32 + BASS audio player  v0.9
+// Compile:
+//   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
+//          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
+//          windowscodecs.lib Comdlg32.lib
+
 #ifndef UNICODE
 #define UNICODE
 #endif
