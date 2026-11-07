@@ -1349,7 +1349,6 @@ struct SoundHotkey {
     UINT    mods;     // MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN
 };
 static std::vector<SoundHotkey> g_soundHotkeys;
-static wchar_t g_startupImportDir[MAX_PATH] = L"";
 static HWND    g_hwndHotkeyDlg = NULL;
 
 // Hotkey bind dialog control IDs
@@ -1476,34 +1475,6 @@ static void FormatHotkeyText(UINT vk, UINT mods, wchar_t* out, size_t n)
     if (mods & MOD_ALT)     wcscat_s(pre, L"Alt+");
     if (mods & MOD_WIN)     wcscat_s(pre, L"Win+");
     swprintf_s(out, n, L"%s%s", pre, key);
-}
-
-// --- Startup default import folder: append audio files, skip duplicates ---
-static void ImportStartupFolder()
-{
-    if (!g_startupImportDir[0]) return;
-    wchar_t pat[MAX_PATH];
-    swprintf_s(pat, L"%s\\*.*", g_startupImportDir);
-    WIN32_FIND_DATAW fd;
-    HANDLE h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    int added = 0;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        wchar_t full[MAX_PATH];
-        swprintf_s(full, L"%s\\%s", g_startupImportDir, fd.cFileName);
-        if (!IsAudio(full)) continue;
-        bool exists = false;
-        for (auto& t : g_playlist)
-            if (_wcsicmp(t.path, full) == 0) { exists = true; break; }
-        if (!exists) { AddTrack(full); added++; }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    if (added > 0) {
-        RebuildShuffleOrder();
-        UpdateStatusBar();
-        if (g_columnView) SyncColumnView();
-    }
 }
 
 // --- Local (in-app) hotkey matching for the message loop pre-filter ---
@@ -2362,7 +2333,6 @@ void SaveSettings()
         // Keep legacy key in sync (first folder)
         WritePrivateProfileString(L"Paths", L"MediaFolder", g_mediaFolder, g_iniPath);
     }
-    WritePrivateProfileString(L"Paths", L"StartupImportDir", g_startupImportDir, g_iniPath);
     {
         wchar_t mb[8];
         swprintf_s(mb, L"%d", g_micOutEnabled ? 1 : 0); WritePrivateProfileString(L"MicOut", L"Enabled", mb, g_iniPath);
@@ -2479,9 +2449,8 @@ void LoadSettings()
         float vol = GETF(L"UI", L"Volume", 0.8f);
         currentVolume = max(0.0f, min(1.0f, vol));
     }
-    g_rememberSession = GETI(L"UI", L"RememberSession", 0);
+    g_rememberSession = GETI(L"UI", L"RememberSession", 1);
     if (g_rememberSession < 0 || g_rememberSession > 2) g_rememberSession = 0;
-    GetPrivateProfileString(L"Paths", L"StartupImportDir", L"", g_startupImportDir, MAX_PATH, g_iniPath);
     g_micOutEnabled = GETI(L"MicOut", L"Enabled", 0) != 0;
     g_micOutMode = GETI(L"MicOut", L"Mode", 1);
     if (g_micOutMode < 0 || g_micOutMode > 1) g_micOutMode = 1;
@@ -9018,8 +8987,6 @@ static void SmtcCleanup()
 #define ID_OPT_SESSION_TRACK  656
 #define ID_OPT_SESSION_SEEK   657
 #define ID_OPT_DROP_LOADDIR   658
-#define ID_OPT_STARTUP_DIR    659
-#define ID_OPT_STARTUP_BROWSE 660
 #define ID_OPT_MICOUT_ENABLE   661
 #define ID_OPT_MICOUT_ONLY     662
 #define ID_OPT_MICOUT_BOTH     663
@@ -9035,6 +9002,69 @@ static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND: {
         HDC dc = (HDC)wp; RECT rc; GetClientRect(hwnd, &rc);
         FillRect(dc, &rc, g_brBg); return 1;
+    }
+    case WM_SHOWWINDOW: {
+        // Page just became visible: reset scroll and fit the scrollbar to content
+        if (wParam) {
+            int oldy = GetScrollPos(hwnd, SB_VERT);
+            if (oldy) {
+                ScrollWindowEx(hwnd, 0, oldy, NULL, NULL, NULL, NULL,
+                    SW_SCROLLCHILDREN | SW_INVALIDATE);
+                SetScrollPos(hwnd, SB_VERT, 0, TRUE);
+            }
+            int maxBottom = 0;
+            for (HWND hc = GetWindow(hwnd, GW_CHILD); hc; hc = GetWindow(hc, GW_HWNDNEXT)) {
+                RECT rc; GetWindowRect(hc, &rc);
+                POINT tl = { rc.left, rc.top };
+                ScreenToClient(hwnd, &tl);
+                int b = tl.y + (rc.bottom - rc.top);
+                if (b > maxBottom) maxBottom = b;
+            }
+            RECT crc; GetClientRect(hwnd, &crc);
+            SCROLLINFO si = { sizeof(si), SIF_RANGE | SIF_PAGE,
+                0, (int)max(0, maxBottom - (int)crc.bottom), (UINT)max(1, (int)crc.bottom) };
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+            ShowScrollBar(hwnd, SB_VERT, maxBottom > (int)crc.bottom);
+        }
+        break;
+    }
+    case WM_VSCROLL: {
+        SCROLLINFO si = { sizeof(si), SIF_ALL };
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int oldy = si.nPos;
+        switch (LOWORD(wParam)) {
+        case SB_TOP:      si.nPos = 0; break;
+        case SB_BOTTOM:   si.nPos = si.nMax; break;
+        case SB_LINEUP:   si.nPos -= 24; break;
+        case SB_LINEDOWN: si.nPos += 24; break;
+        case SB_PAGEUP:   si.nPos -= (int)si.nPage; break;
+        case SB_PAGEDOWN: si.nPos += (int)si.nPage; break;
+        case SB_THUMBTRACK:
+        case SB_THUMBPOSITION: si.nPos = si.nTrackPos; break;
+        }
+        si.fMask = SIF_POS;
+        SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        if (si.nPos != oldy)
+            ScrollWindowEx(hwnd, 0, oldy - si.nPos, NULL, NULL, NULL, NULL,
+                SW_SCROLLCHILDREN | SW_INVALIDATE);
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        int wdelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        SCROLLINFO si = { sizeof(si), SIF_ALL };
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        if (si.nMax > 0) {
+            int oldy = si.nPos;
+            si.nPos -= (wdelta / WHEEL_DELTA) * 72;   // 3 lines per notch
+            si.fMask = SIF_POS;
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+            GetScrollInfo(hwnd, SB_VERT, &si);
+            if (si.nPos != oldy)
+                ScrollWindowEx(hwnd, 0, oldy - si.nPos, NULL, NULL, NULL, NULL,
+                    SW_SCROLLCHILDREN | SW_INVALIDATE);
+        }
+        return 0;
     }
     case WM_HSCROLL:
     case WM_COMMAND:
@@ -9131,8 +9161,9 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             return hB;
         };
         auto mkPanel = [&](bool visible) -> HWND {
+            // WS_VSCROLL: the bar itself is shown/hidden per page in WM_SHOWWINDOW
             return CreateWindow(L"BillyOptPanel", L"",
-                WS_CHILD | (visible ? WS_VISIBLE : 0),
+                WS_CHILD | WS_VSCROLL | (visible ? WS_VISIBLE : 0),
                 PNL_X, PNL_Y, PNL_W, PNL_H, hwnd, NULL, hInst, NULL);
         };
 
@@ -9189,17 +9220,12 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
             grp(p, 0, 290, w, 92, L"记住会话");
             { HWND h = rad(p, 10, 308, w - 20, 20, ID_OPT_SESSION_OFF,
-                L"不记住（默认）", g_rememberSession == 0);
+                L"不记住", g_rememberSession == 0);
               SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
             rad(p, 10, 328, w - 20, 20, ID_OPT_SESSION_TRACK,
                 L"记住播放列表和曲目", g_rememberSession == 1);
             rad(p, 10, 348, w - 20, 20, ID_OPT_SESSION_SEEK,
                 L"记住播放列表、曲目和进度位置", g_rememberSession == 2);
-
-            grp(p, 0, 392, w, 96, L"启动导入");
-            lbl(p, 10, 412, w - 20, 16, L"启动时自动导入此文件夹（留空则不导入）:");
-            edt(p, 10, 432, w - 104, 20, ID_OPT_STARTUP_DIR, g_startupImportDir);
-            btn(p, w - 90, 431, 80, 22, ID_OPT_STARTUP_BROWSE, L"浏览...");
         }
 
         // ── Page 1: Display ───────────────────────────────────────────────
@@ -9326,18 +9352,18 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             lbl(p, 10, 218, w - 20, 32, L"录制为 FLAC（无损）。\r\n留空则每次询问。");
 
             // Microphone output (soundboard → virtual cable)
-            grp(p, 0, 276, w, 198, L"麦克风输出（虚拟声卡）");
-            chk(p, 10, 296, w - 20, 20, ID_OPT_MICOUT_ENABLE, L"启用麦克风输出（把声音送入虚拟声卡）", g_micOutEnabled);
-            { HWND h = rad(p, 10, 320, w - 20, 20, ID_OPT_MICOUT_ONLY,
+            grp(p, 0, 276, w, 196, L"麦克风输出（虚拟声卡）");
+            chk(p, 10, 294, w - 20, 20, ID_OPT_MICOUT_ENABLE, L"启用麦克风输出（把声音送入虚拟声卡）", g_micOutEnabled);
+            { HWND h = rad(p, 10, 318, w - 20, 20, ID_OPT_MICOUT_ONLY,
                 L"仅输出到虚拟声卡（本机扬声器静音）", g_micOutMode == 0);
               SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
-            rad(p, 10, 340, w - 20, 20, ID_OPT_MICOUT_BOTH,
+            rad(p, 10, 338, w - 20, 20, ID_OPT_MICOUT_BOTH,
                 L"扬声器和虚拟声卡同时输出", g_micOutMode == 1);
-            lbl(p, 10, 370, 76, 16, L"输出设备:");
+            lbl(p, 10, 366, 76, 16, L"输出设备:");
             {
                 HWND hMicCombo = CreateWindow(L"COMBOBOX", L"",
                     WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS,
-                    88, 366, w - 98, 200, p, (HMENU)ID_OPT_MICOUT_COMBO, hInst, NULL);
+                    88, 362, w - 98, 200, p, (HMENU)ID_OPT_MICOUT_COMBO, hInst, NULL);
                 SendMessage(hMicCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
                 BASS_DEVICEINFO mdi; int msel = -1, mcnt = 0;
                 for (int d = 1; BASS_GetDeviceInfo(d, &mdi); d++) {
@@ -9356,7 +9382,7 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 wchar_t mstat[320];
                 int md = g_micOutEnabled ? MicOutFindDevice() : -1;
                 if (!g_micOutEnabled)
-                    swprintf_s(mstat, L"当前未启用。启用后如未检测到虚拟声卡会在此提示。");
+                    swprintf_s(mstat, L"当前未启用。");
                 else if (md >= 0) {
                     BASS_DEVICEINFO mdi = {};
                     BASS_GetDeviceInfo(md, &mdi);
@@ -9364,12 +9390,12 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     MultiByteToWideChar(CP_ACP, 0, mdi.name, -1, mn, 256);
                     swprintf_s(mstat, L"已连接: %s", mn);
                 } else
-                    swprintf_s(mstat, L"⚠ 未检测到 VB-CABLE / Virtual Cable 虚拟声卡");
+                    swprintf_s(mstat, L"⚠ 未检测到虚拟声卡（VB-CABLE）");
                 HWND hMicStat = CreateWindow(L"STATIC", mstat, WS_CHILD|WS_VISIBLE|SS_LEFT,
-                    10, 392, w - 20, 32, p, (HMENU)ID_OPT_MICOUT_STATUS, hInst, NULL);
+                    10, 390, w - 20, 18, p, (HMENU)ID_OPT_MICOUT_STATUS, hInst, NULL);
                 SendMessage(hMicStat, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
             }
-            lbl(p, 10, 428, w - 20, 40, L"用法: 在 QQ / 微信 / OBS 等软件里把输入（麦克风）\r\n设备选为 “CABLE Output”。没装? 到 vb-audio.com/Cable\r\n免费下载 VB-CABLE。");
+            lbl(p, 10, 414, w - 16, 36, L"语音软件里把输入设备选为 “CABLE Output”:\r\n没装? 到 vb-audio.com/Cable 免费下载。");
         }
 
         // ── Page 4: Media ─────────────────────────────────────────────────
@@ -9422,6 +9448,9 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             lbl(p, 10, 132, w - 20, 14, L"时间显示会随时长变化更新。");
         }
 
+        // Initialize page-0 scrollbar state (its WM_SHOWWINDOW fired before children existed)
+        SendMessage(s_optPanels[0], WM_SHOWWINDOW, TRUE, 0);
+
         break;
     }
 
@@ -9446,13 +9475,6 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             }
             break;
 
-        case ID_OPT_STARTUP_BROWSE: {
-            wchar_t folder[MAX_PATH] = {};
-            GetDlgItemTextW(hwnd, ID_OPT_STARTUP_DIR, folder, MAX_PATH);
-            if (PickFolder(hwnd, L"选择启动导入的文件夹", folder, MAX_PATH))
-                SetDlgItemTextW(hwnd, ID_OPT_STARTUP_DIR, folder);
-            break;
-        }
         case ID_OPT_MEDIA_ADD: {
             wchar_t folder[MAX_PATH] = {};
             if (PickFolder(hwnd, L"选择媒体文件夹", folder, MAX_PATH)) {
@@ -9626,17 +9648,6 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 g_rememberSession = 1;
             else
                 g_rememberSession = 0;
-            // Startup import folder (trim quotes / trailing backslashes, keep "C:\")
-            {
-                wchar_t tmpDir[MAX_PATH];
-                GetDlgItemText(s_optPanels[0], ID_OPT_STARTUP_DIR, tmpDir, MAX_PATH);
-                wchar_t* dirStr = tmpDir;
-                size_t dirLen = wcslen(dirStr);
-                if (dirLen >= 2 && dirStr[0] == L'"' && dirStr[dirLen - 1] == L'"') { dirStr[dirLen - 1] = L'\0'; dirStr++; }
-                dirLen = wcslen(dirStr);
-                while (dirLen > 3 && dirStr[dirLen - 1] == L'\\') dirStr[--dirLen] = L'\0';
-                wcsncpy_s(g_startupImportDir, dirStr, _TRUNCATE);
-            }
             // Microphone output
             g_micOutEnabled = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
             g_micOutMode = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_BOTH), BM_GETCHECK,0,0)==BST_CHECKED) ? 1 : 0;
@@ -12743,11 +12754,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             }
         }
     }
-
-    // Soundboard: import the configured startup folder on every launch (deduped)
-    if (g_startupImportDir[0] &&
-        GetFileAttributesW(g_startupImportDir) != INVALID_FILE_ATTRIBUTES)
-        ImportStartupFolder();
 
     // Sync column view now that playlist is loaded
     if (g_columnView) SyncColumnView();
