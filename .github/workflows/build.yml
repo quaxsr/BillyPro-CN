@@ -22,7 +22,7 @@ jobs:
           cmake --build build --config Release
           cd ..
           
-          # 3. 编译 dcadec
+          # 3. 给 dcadec 注入数学宏并编译
           Set-Content -Path "dca_src/CMakeLists.txt" -Value @"
           cmake_minimum_required(VERSION 3.10)
           project(dcadec C)
@@ -36,7 +36,7 @@ jobs:
           cmake --build build --config Release
           cd ..
           
-          # 4. 整理文件和目录
+          # 4. 收集头文件和静态库
           New-Item -ItemType Directory -Force -Path include/FLAC
           New-Item -ItemType Directory -Force -Path lib
           Copy-Item -Path flac_src/include/FLAC/* -Destination include/FLAC/ -Force
@@ -52,13 +52,14 @@ jobs:
           $content = $content.TrimStart([char]0xFEFF)
           [System.IO.File]::WriteAllText("$PWD\BillyPro.cpp", $content, [System.Text.Encoding]::UTF8)
 
-          # 6. 生成 MSBuild 自动读取的配置文件（绝杀！）
+          # 6. 生成配置文件，最关键的一步：加上 _CRT_SECURE_NO_WARNINGS 宏定义
           $props = @"
           <Project>
             <ItemDefinitionGroup>
               <ClCompile>
                 <AdditionalIncludeDirectories>`$(MSBuildThisFileDirectory)include;`$(MSBuildThisFileDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
                 <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+                <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
               </ClCompile>
               <Link>
                 <AdditionalDependencies>bass.lib;libFLAC.lib;dcadec.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -70,7 +71,6 @@ jobs:
           Set-Content -Path "Directory.Build.props" -Value $props -Encoding UTF8
 
       - name: Build BillyPro
-        # 没有引号、没有分号、没有超长参数，就一句话！
         run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143
         
       - uses: actions/upload-artifact@v4
