@@ -8,9 +8,16 @@ jobs:
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
-      
+        
+      - name: Download FLAC Headers
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/xiph/flac/archive/refs/tags/1.4.3.zip" -OutFile "flac.zip"
+          Expand-Archive -Path "flac.zip" -DestinationPath "."
+          mkdir FLAC
+          Copy-Item -Path "flac-1.4.3\include\FLAC\*" -Destination "FLAC\" -Recurse
+        
       - name: Build with MSBuild
-        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143
+        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143 /p:AdditionalOptions="/utf-8"
         
       - uses: actions/upload-artifact@v4
         with:
