@@ -12,45 +12,50 @@ jobs:
       - name: Fetch and Compile Dependencies (FLAC & dcadec)
         shell: pwsh
         run: |
-          # 1. 克隆 FLAC 和 dcadec 源码
+          # 1. 克隆源码
           git clone https://github.com/xiph/flac.git flac_src --depth 1 --branch 1.4.3
           git clone https://github.com/foo86/dcadec.git dca_src --depth 1
           
-          # 2. 用 CMake 编译 FLAC (静态库)
+          # 2. 编译 FLAC (强制关掉文档生成)
           cd flac_src
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DWITH_OGG=OFF
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF -DWITH_OGG=OFF -DINSTALL_MANPAGES=OFF
           cmake --build build --config Release
           cd ..
           
-          # 3. 用 CMake 编译 dcadec (静态库)
+          # 3. 给 dcadec 现场造一个 CMakeLists.txt
+          Set-Content -Path "dca_src/CMakeLists.txt" -Value @"
+          cmake_minimum_required(VERSION 3.10)
+          project(dcadec C)
+          file(GLOB SRCS "libdcadec/*.c")
+          add_library(dcadec STATIC `${SRCS})
+          target_include_directories(dcadec PUBLIC libdcadec)
+          "@
+          
+          # 4. 编译 dcadec
           cd dca_src
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release
           cd ..
           
-          # 4. 创建我们自己的依赖文件夹
+          # 5. 收集头文件和静态库
           New-Item -ItemType Directory -Force -Path include/FLAC
           New-Item -ItemType Directory -Force -Path lib
           
-          # 5. 把 FLAC 的头文件和编译出的 lib 复制过去
           Copy-Item -Path flac_src/include/FLAC/* -Destination include/FLAC/ -Force
           Copy-Item -Path flac_src/build/src/lib/Release/libFLAC.lib -Destination lib/ -ErrorAction SilentlyContinue
-          # 兼容不同版本可能生成的名字
-          Copy-Item -Path flac_src/build/src/lib/Release/FLAC.lib -Destination lib/ -ErrorAction SilentlyContinue
           
-          # 6. 把 dcadec 的头文件和编译出的 lib 复制过去
           Copy-Item -Path dca_src/libdcadec/dca_context.h -Destination ./ -Force
           Copy-Item -Path dca_src/libdcadec/dca_frame.h -Destination ./ -Force
           Copy-Item -Path dca_src/build/Release/dcadec.lib -Destination lib/ -ErrorAction SilentlyContinue
-          
-          # 7. 清理 BillyPro.cpp 源码里自带的无形 BOM 乱码
+
+          # 6. 清理 BillyPro.cpp 的 BOM
           $content = Get-Content "BillyPro.cpp" -Raw
           $content = $content.TrimStart([char]0xFEFF)
           [System.IO.File]::WriteAllText("$PWD\BillyPro.cpp", $content, [System.Text.Encoding]::UTF8)
 
       - name: Build BillyPro
-        # 强行让编译器去我们刚才准备好的 include 和 lib 文件夹里找文件
-        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143 /p:AdditionalIncludeDirectories="${{ github.workspace }}\include" /p:AdditionalDependencies="libFLAC.lib;dcadec.lib;%(AdditionalDependencies)" /p:AdditionalLibraryDirectories="${{ github.workspace }}\lib"
+        # 把刚才编译出的库直接暴力塞给编译器，顺带加上 /utf-8 防止中文乱码报错
+        run: msbuild BillyPro.vcxproj /p:Configuration=Release /p:Platform=x64 /m /p:PlatformToolset=v143 /p:AdditionalIncludeDirectories="${{ github.workspace }}\include;$(pwd)\dca_src\libdcadec" /p:AdditionalDependencies="bass.lib;libFLAC.lib;dcadec.lib;%(AdditionalDependencies)" /p:AdditionalLibraryDirectories="${{ github.workspace }}\lib" /p:AdditionalOptions="/utf-8"
         
       - uses: actions/upload-artifact@v4
         with:
