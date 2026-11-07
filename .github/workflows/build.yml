@@ -52,14 +52,14 @@ jobs:
           $content = $content.TrimStart([char]0xFEFF)
           [System.IO.File]::WriteAllText("$PWD\BillyPro.cpp", $content, [System.Text.Encoding]::UTF8)
 
-          # 6. 生成配置文件，最关键的一步：加上 _CRT_SECURE_NO_WARNINGS 宏定义
+          # 6. 生成配置文件（注意：加上了 FLAC__NO_DLL）
           $props = @"
           <Project>
             <ItemDefinitionGroup>
               <ClCompile>
                 <AdditionalIncludeDirectories>`$(MSBuildThisFileDirectory)include;`$(MSBuildThisFileDirectory);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
                 <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
-                <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+                <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;FLAC__NO_DLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
               </ClCompile>
               <Link>
                 <AdditionalDependencies>bass.lib;libFLAC.lib;dcadec.lib;%(AdditionalDependencies)</AdditionalDependencies>
