@@ -1,4 +1,4 @@
-﻿﻿// BillyPro.cpp  -  Win32 + BASS audio player  v0.9
+﻿// BillyPro.cpp  -  Win32 + BASS audio player  v0.9
 // Compile:
 //   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
 //          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
@@ -96,6 +96,7 @@ extern "C" {
 #define IDC_CTX_FAV_REMOVE    307  // Remove from Favorites
 #define IDC_CTX_PL_NEW        308  // Add to new playlist
 #define IDC_CTX_PL_BASE       310  // 310..399 = existing playlists
+#define IDC_CTX_HOTKEY        309  // Bind global/local hotkey (soundboard)
 
 // Library menu
 #define IDM_LIB_FAVORITES     2501
@@ -215,6 +216,9 @@ extern "C" {
 #define ID_HOTKEY_NEXT          802
 #define ID_HOTKEY_PREV          803
 #define ID_HOTKEY_STOP          804
+// Soundboard per-track hotkey slots (global hotkeys)
+#define ID_HOTKEY_SND_BASE      820
+#define SNDHK_MAX               128
 // File association dialog controls
 #define ID_ASSOC_LIST           701
 #define ID_ASSOC_SELALL         702
@@ -1336,6 +1340,579 @@ static void GetIniPath()
 }
 
 // ============================================================
+//  Soundboard: startup import folder + per-track hotkeys
+// ============================================================
+struct SoundHotkey {
+    wchar_t path[MAX_PATH];
+    bool    global;   // true: system-wide (RegisterHotKey) / false: only while BillyPro is active
+    UINT    vk;
+    UINT    mods;     // MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN
+};
+static std::vector<SoundHotkey> g_soundHotkeys;
+static wchar_t g_startupImportDir[MAX_PATH] = L"";
+static HWND    g_hwndHotkeyDlg = NULL;
+
+// Hotkey bind dialog control IDs
+#define IDHK_GLOBAL   901
+#define IDHK_LOCAL    902
+#define IDHK_KEY      903
+#define IDHK_CLEAR    904
+#define IDHK_OK       905
+#define IDHK_CANCEL   906
+
+// --- INI key escaping: section keys cannot contain '=' -> %3D ('%' -> %25) ---
+static void HkEncodeKey(const wchar_t* path, wchar_t* out, size_t n)
+{
+    size_t o = 0;
+    for (size_t i = 0; path[i] && o + 3 < n; i++) {
+        if (path[i] == L'%')      { out[o++] = L'%'; out[o++] = L'2'; out[o++] = L'5'; }
+        else if (path[i] == L'=') { out[o++] = L'%'; out[o++] = L'3'; out[o++] = L'D'; }
+        else out[o++] = path[i];
+    }
+    out[o] = L'\0';
+}
+static void HkDecodeKey(const wchar_t* key, wchar_t* out, size_t n)
+{
+    size_t o = 0;
+    for (size_t i = 0; key[i] && o + 1 < n; i++) {
+        if (key[i] == L'%' && key[i + 1] == L'2' && key[i + 2] == L'5') { out[o++] = L'%'; i += 2; }
+        else if (key[i] == L'%' && key[i + 1] == L'3' && key[i + 2] == L'D') { out[o++] = L'='; i += 2; }
+        else out[o++] = key[i];
+    }
+    out[o] = L'\0';
+}
+
+static int FindSoundHotkey(const wchar_t* path)
+{
+    for (int i = 0; i < (int)g_soundHotkeys.size(); i++)
+        if (_wcsicmp(g_soundHotkeys[i].path, path) == 0) return i;
+    return -1;
+}
+
+// Read [Hotkeys] section: "escaped path" = G|vk|mods  (G = global, L = local)
+static void LoadSoundHotkeys()
+{
+    g_soundHotkeys.clear();
+    std::vector<wchar_t> buf(4096);
+    for (;;) {
+        DWORD ret = GetPrivateProfileSectionW(L"Hotkeys", buf.data(), (DWORD)buf.size(), g_iniPath);
+        if (ret < buf.size() - 2 || buf.size() >= 262144) break;
+        buf.resize(buf.size() * 2);
+    }
+    for (wchar_t* line = buf.data(); *line; line += wcslen(line) + 1) {
+        wchar_t* eq = wcschr(line, L'=');
+        if (!eq || eq == line) continue;
+        *eq = L'\0';
+        const wchar_t* v = eq + 1;
+        bool global = false; UINT vk = 0, mods = 0;
+        if ((*v == L'G' || *v == L'L') && v[1] == L'|') {
+            global = (*v == L'G');
+            vk = (UINT)_wtoi(v + 2);
+            const wchar_t* p2 = wcschr(v + 2, L'|');
+            if (p2) mods = (UINT)_wtoi(p2 + 1);
+        }
+        if (!vk) continue;
+        SoundHotkey hk = {};
+        HkDecodeKey(line, hk.path, MAX_PATH);
+        if (!hk.path[0]) continue;
+        hk.global = global; hk.vk = vk; hk.mods = mods;
+        if ((int)g_soundHotkeys.size() < SNDHK_MAX)
+            g_soundHotkeys.push_back(hk);
+    }
+}
+
+// Write (or remove when hk == NULL) one binding under [Hotkeys]
+static void WriteSoundHotkeyIni(const wchar_t* path, const SoundHotkey* hk)
+{
+    GetIniPath();
+    wchar_t key[MAX_PATH * 3 + 2] = L"";
+    HkEncodeKey(path, key, MAX_PATH * 3 + 2);
+    if (hk) {
+        wchar_t val[32];
+        swprintf_s(val, L"%c|%u|%u", hk->global ? L'G' : L'L', hk->vk, hk->mods);
+        WritePrivateProfileStringW(L"Hotkeys", key, val, g_iniPath);
+    } else {
+        WritePrivateProfileStringW(L"Hotkeys", key, NULL, g_iniPath);
+    }
+}
+
+// Rebuild all system-wide registrations (also clears stale slots)
+static void RegisterAllSoundHotkeys(HWND hwnd)
+{
+    if (!hwnd || !IsWindow(hwnd)) return;
+    for (int i = 0; i < SNDHK_MAX; i++) UnregisterHotKey(hwnd, ID_HOTKEY_SND_BASE + i);
+    for (int i = 0; i < (int)g_soundHotkeys.size(); i++) {
+        if (!g_soundHotkeys[i].global) continue;
+        RegisterHotKey(hwnd, ID_HOTKEY_SND_BASE + i,
+            g_soundHotkeys[i].mods | MOD_NOREPEAT, g_soundHotkeys[i].vk);
+    }
+}
+
+// Play a bound sound; if it left the playlist, add it back first (Soundpad behavior)
+static void TriggerSoundHotkey(int slot)
+{
+    if (slot < 0 || slot >= (int)g_soundHotkeys.size()) return;
+    const wchar_t* path = g_soundHotkeys[slot].path;
+    for (int i = 0; i < (int)g_playlist.size(); i++)
+        if (_wcsicmp(g_playlist[i].path, path) == 0) { PlayIndex(i); return; }
+    AddTrack(path);
+    RebuildShuffleOrder();
+    UpdateStatusBar();
+    if (g_columnView) SyncColumnView();
+    for (int i = 0; i < (int)g_playlist.size(); i++)
+        if (_wcsicmp(g_playlist[i].path, path) == 0) { PlayIndex(i); break; }
+}
+
+// "Ctrl+Alt+K" style name for a hotkey
+static void FormatHotkeyText(UINT vk, UINT mods, wchar_t* out, size_t n)
+{
+    wchar_t key[32] = L"";
+    UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    if (sc) GetKeyNameTextW((LONG)(sc << 16), key, 32);
+    if (!key[0]) swprintf_s(key, 32, L"0x%02X", vk);
+    wchar_t pre[24] = L"";
+    if (mods & MOD_CONTROL) wcscat_s(pre, L"Ctrl+");
+    if (mods & MOD_SHIFT)   wcscat_s(pre, L"Shift+");
+    if (mods & MOD_ALT)     wcscat_s(pre, L"Alt+");
+    if (mods & MOD_WIN)     wcscat_s(pre, L"Win+");
+    swprintf_s(out, n, L"%s%s", pre, key);
+}
+
+// --- Startup default import folder: append audio files, skip duplicates ---
+static void ImportStartupFolder()
+{
+    if (!g_startupImportDir[0]) return;
+    wchar_t pat[MAX_PATH];
+    swprintf_s(pat, L"%s\\*.*", g_startupImportDir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    int added = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t full[MAX_PATH];
+        swprintf_s(full, L"%s\\%s", g_startupImportDir, fd.cFileName);
+        if (!IsAudio(full)) continue;
+        bool exists = false;
+        for (auto& t : g_playlist)
+            if (_wcsicmp(t.path, full) == 0) { exists = true; break; }
+        if (!exists) { AddTrack(full); added++; }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (added > 0) {
+        RebuildShuffleOrder();
+        UpdateStatusBar();
+        if (g_columnView) SyncColumnView();
+    }
+}
+
+// --- Local (in-app) hotkey matching for the message loop pre-filter ---
+static int MatchLocalSoundHotkey(UINT vk, UINT mods)
+{
+    for (int i = 0; i < (int)g_soundHotkeys.size(); i++) {
+        const SoundHotkey& hk = g_soundHotkeys[i];
+        if (!hk.global && hk.vk == vk && hk.mods == mods) return i;
+    }
+    return -1;
+}
+static bool IsTypingFocus()
+{
+    HWND fw = GetFocus();
+    if (!fw) return false;
+    wchar_t cls[12] = L"";
+    if (GetClassNameW(fw, cls, 12) <= 0) return false;
+    return wcscmp(cls, L"Edit") == 0 || wcscmp(cls, L"ComboBox") == 0;
+}
+
+// --- Bind dialog (modal with its own pump, owner disabled while open) ---
+static wchar_t s_hkBindPath[MAX_PATH] = L"";
+
+static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+        int hkIdx = FindSoundHotkey(s_hkBindPath);
+        HWND hG = CreateWindowW(L"BUTTON", L"全局热键（在任何程序中生效）",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
+            14, 14, 310, 20, hwnd, (HMENU)IDHK_GLOBAL, hInst, NULL);
+        HWND hL = CreateWindowW(L"BUTTON", L"局部热键（仅 BillyPro 激活时生效）",
+            WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_TABSTOP,
+            14, 38, 310, 20, hwnd, (HMENU)IDHK_LOCAL, hInst, NULL);
+        HWND hLbl1 = CreateWindowW(L"STATIC", L"按键组合：",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 14, 70, 70, 18, hwnd, NULL, hInst, NULL);
+        HWND hKey = CreateWindowExW(WS_EX_CLIENTEDGE, L"msctls_hotkey32", NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 90, 66, 150, 22, hwnd, (HMENU)IDHK_KEY, hInst, NULL);
+        HWND hLbl2 = CreateWindowW(L"STATIC", L"点击输入框后直接按下想要的组合键",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 14, 96, 310, 16, hwnd, NULL, hInst, NULL);
+        HWND hClr = CreateWindowW(L"BUTTON", L"清除绑定",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 14, 124, 88, 26, hwnd, (HMENU)IDHK_CLEAR, hInst, NULL);
+        HWND hOk = CreateWindowW(L"BUTTON", L"确定",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 152, 124, 80, 26, hwnd, (HMENU)IDHK_OK, hInst, NULL);
+        HWND hCa = CreateWindowW(L"BUTTON", L"取消",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 240, 124, 80, 26, hwnd, (HMENU)IDHK_CANCEL, hInst, NULL);
+        SendMessage(hG, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hL, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hLbl1, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hKey, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hLbl2, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hClr, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hOk, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
+        SendMessage(hCa, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        CheckRadioButton(hwnd, IDHK_GLOBAL, IDHK_LOCAL,
+            (hkIdx >= 0 && g_soundHotkeys[hkIdx].global) ? IDHK_GLOBAL : IDHK_LOCAL);
+        if (hkIdx >= 0) {
+            const SoundHotkey& hk = g_soundHotkeys[hkIdx];
+            BYTE hf = 0;
+            if (hk.mods & MOD_SHIFT)   hf |= HOTKEYF_SHIFT;
+            if (hk.mods & MOD_CONTROL) hf |= HOTKEYF_CONTROL;
+            if (hk.mods & MOD_ALT)     hf |= HOTKEYF_ALT;
+            SendMessage(hKey, HKM_SETHOTKEY, MAKEWPARAM((WORD)hk.vk, hf), 0);
+        }
+        return 0;
+    }
+    case WM_COMMAND: {
+        int cmd = LOWORD(wParam);
+        if (cmd == IDHK_CANCEL) { DestroyWindow(hwnd); return 0; }
+        if (cmd == IDHK_CLEAR) {
+            int i = FindSoundHotkey(s_hkBindPath);
+            if (i >= 0) {
+                g_soundHotkeys.erase(g_soundHotkeys.begin() + i);
+                WriteSoundHotkeyIni(s_hkBindPath, NULL);
+                RegisterAllSoundHotkeys(g_hwnd);
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (cmd == IDHK_OK) {
+            LRESULT hk = SendDlgItemMessageW(hwnd, IDHK_KEY, HKM_GETHOTKEY, 0, 0);
+            UINT vk = LOBYTE(LOWORD(hk));
+            BYTE hf = HIBYTE(LOWORD(hk));
+            if (!vk) {
+                MessageBoxW(hwnd, L"请先点击输入框并按下想要的按键组合。", L"绑定热键", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            UINT mods = 0;
+            if (hf & HOTKEYF_SHIFT)   mods |= MOD_SHIFT;
+            if (hf & HOTKEYF_CONTROL) mods |= MOD_CONTROL;
+            if (hf & HOTKEYF_ALT)     mods |= MOD_ALT;
+            bool global = (IsDlgButtonChecked(hwnd, IDHK_GLOBAL) == BST_CHECKED);
+            if (global && mods == 0 && !(vk >= VK_F1 && vk <= VK_F24)) {
+                if (MessageBoxW(hwnd, L"此全局热键不带 Ctrl/Alt/Shift/Win 修饰键，会屏蔽该按键在其他所有程序中的使用。确定继续吗？",
+                    L"绑定热键", MB_YESNO | MB_ICONWARNING) != IDYES)
+                    return 0;
+            }
+            if (global) {
+                // Trial registration: is the combo free? (skip when it is already ours for this file)
+                bool ours = false;
+                for (auto& e : g_soundHotkeys)
+                    if (e.global && e.vk == vk && e.mods == mods && _wcsicmp(e.path, s_hkBindPath) == 0) { ours = true; break; }
+                if (!ours && !RegisterHotKey(hwnd, 0x7FFF, mods | MOD_NOREPEAT, vk)) {
+                    MessageBoxW(hwnd, L"该热键已被本程序的其他音效或其他程序占用，请换一个组合。", L"绑定热键", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                if (!ours) UnregisterHotKey(hwnd, 0x7FFF);
+            }
+            SoundHotkey nhk = {};
+            wcsncpy_s(nhk.path, s_hkBindPath, _TRUNCATE);
+            nhk.global = global; nhk.vk = vk; nhk.mods = mods;
+            int i = FindSoundHotkey(s_hkBindPath);
+            if (i >= 0) g_soundHotkeys[i] = nhk;
+            else if ((int)g_soundHotkeys.size() < SNDHK_MAX) g_soundHotkeys.push_back(nhk);
+            WriteSoundHotkeyIni(s_hkBindPath, &nhk);
+            RegisterAllSoundHotkeys(g_hwnd);
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        if (wParam == VK_RETURN) { SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDHK_OK, 0), 0); return 0; }
+        break;
+    case WM_DESTROY:
+        g_hwndHotkeyDlg = NULL;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void OpenHotkeyBindDialog(const wchar_t* path)
+{
+    if (!path || !path[0] || !g_hwnd || !IsWindow(g_hwnd)) return;
+    if (g_hwndHotkeyDlg && IsWindow(g_hwndHotkeyDlg)) { SetForegroundWindow(g_hwndHotkeyDlg); return; }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = HotkeyDlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"BillyHotkeyDlg";
+        RegisterClassW(&wc);
+        reg = true;
+    }
+    wcsncpy_s(s_hkBindPath, path, _TRUNCATE);
+    wchar_t cap[160];
+    swprintf_s(cap, L"绑定热键 - %s", Filename(path));
+    RECT rc; GetWindowRect(g_hwnd, &rc);
+    int ww = 340, wh = 200;
+    int x = rc.left + max(0, ((rc.right - rc.left) - ww) / 2);
+    int y = rc.top + max(0, ((rc.bottom - rc.top) - wh) / 2);
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"BillyHotkeyDlg", cap,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, ww, wh, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
+    if (!dlg) return;
+    EnableWindow(g_hwnd, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+    MSG m = {};
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (IsDialogMessageW(dlg, &m)) continue;
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    if (m.message == WM_QUIT) PostQuitMessage((int)m.wParam);
+    EnableWindow(g_hwnd, TRUE);
+    SetActiveWindow(g_hwnd);
+}
+
+// ============================================================
+//  Mic output (soundboard): route playback into a virtual
+//  sound card (VB-CABLE "CABLE Input") so voice apps can use
+//  it as a microphone.  Two modes:
+//    0 = only the virtual card (speakers silent)
+//    1 = speakers + virtual card: a low-priority DSP taps the
+//        post-FX master stream and pushes it into a push
+//        stream living on the cable device (no extra thread)
+// ============================================================
+static bool    g_micOutEnabled = false;          // [MicOut] Enabled
+static int     g_micOutMode = 1;                 // [MicOut] Mode (0 = only, 1 = both)
+static wchar_t g_micOutDeviceName[256] = L"";    // [MicOut] Device (matched by name)
+static int     g_micOutDev = -1;                 // resolved BASS device index (session only)
+static HSTREAM g_micTapStream = NULL;            // push stream on the cable device
+static HDSP    g_micTapDsp = NULL;               // tap DSP on currentStream
+static DWORD   g_micTapLimit = 0;                // max queued bytes (drift guard)
+static DWORD   g_micTapLastFlush = 0;            // seek-flush coalescing
+static int     g_micTapFails = 0;                // consecutive push failures
+static bool    g_micOutMissingShown = false;     // one-time guidance popups
+static bool    g_micOutHintShown = false;
+static CRITICAL_SECTION g_micTapCs;              // guards g_micTapStream (mix thread vs UI)
+static struct MicTapCsInit { MicTapCsInit() { InitializeCriticalSection(&g_micTapCs); } ~MicTapCsInit() { DeleteCriticalSection(&g_micTapCs); } } g_micTapCsInit;
+
+#define MICOUT_WM_TAPLOST   (WM_APP + 96)   // cable device died during playback
+#define MICOUT_WM_STARTHINT (WM_APP + 97)   // deferred guidance popup
+
+static wchar_t MicOutUp(wchar_t c) { return (c >= L'a' && c <= L'z') ? (wchar_t)(c - L'a' + L'A') : c; }
+static bool MicOutContainsI(const wchar_t* hay, const wchar_t* needle)
+{
+    if (!hay || !needle || !needle[0]) return false;
+    size_t nl = wcslen(needle);
+    for (const wchar_t* p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && MicOutUp(p[i]) == MicOutUp(needle[i])) i++;
+        if (i == nl) return true;
+    }
+    return false;
+}
+// Keyword match: VB-Cable's render endpoint is named "CABLE Input (VB-Audio Virtual Cable)"
+static bool MicOutNameMatches(const char* nameA)
+{
+    wchar_t w[256];
+    if (!MultiByteToWideChar(CP_ACP, 0, nameA, -1, w, 256)) return false;
+    return MicOutContainsI(w, L"CABLE Input") || MicOutContainsI(w, L"Virtual Cable") ||
+           MicOutContainsI(w, L"VB-Audio");
+}
+static bool MicOutDevReady()
+{
+    if (g_micOutDev <= 0) return false;
+    BASS_DEVICEINFO di = {};
+    if (!BASS_GetDeviceInfo(g_micOutDev, &di) || !(di.flags & BASS_DEVICE_ENABLED)) return false;
+    return (di.flags & BASS_DEVICE_INIT) != 0;
+}
+// Find the cable device: stored name first, then the generic keywords. -1 = none.
+static int MicOutFindDevice()
+{
+    if (g_micOutDeviceName[0]) {
+        for (int d = 1;; d++) {
+            BASS_DEVICEINFO di = {};
+            if (!BASS_GetDeviceInfo(d, &di)) break;
+            if (!(di.flags & BASS_DEVICE_ENABLED)) continue;
+            wchar_t w[256];
+            if (MultiByteToWideChar(CP_ACP, 0, di.name, -1, w, 256) && _wcsicmp(w, g_micOutDeviceName) == 0)
+                return d;
+        }
+    }
+    for (int d = 1;; d++) {
+        BASS_DEVICEINFO di = {};
+        if (!BASS_GetDeviceInfo(d, &di)) break;
+        if ((di.flags & BASS_DEVICE_ENABLED) && MicOutNameMatches(di.name)) return d;
+    }
+    return -1;
+}
+static bool MicOutEnsureDevice()
+{
+    if (!g_micOutEnabled) return false;
+    if (MicOutDevReady()) return true;
+    int idx = MicOutFindDevice();
+    if (idx <= 0) { g_micOutDev = -1; return false; }
+    g_micOutDev = idx;
+    BASS_DEVICEINFO di = {};
+    BASS_GetDeviceInfo(idx, &di);
+    if (!(di.flags & BASS_DEVICE_INIT) && !BASS_Init(idx, 48000, 0, NULL, NULL)) {
+        g_micOutDev = -1;
+        return false;
+    }
+    return true;
+}
+static void MicOutReleaseDevice()
+{
+    if (g_micOutDev <= 0) return;
+    BASS_DEVICEINFO di = {};
+    bool inited = BASS_GetDeviceInfo(g_micOutDev, &di) && (di.flags & BASS_DEVICE_INIT);
+    bool isSpeaker = ((DWORD)g_micOutDev == BASS_GetDevice());
+    if (inited && !isSpeaker) { BASS_SetDevice(g_micOutDev); BASS_Free(); }
+    g_micOutDev = -1;
+}
+static void MicOutHintOnce()
+{
+    if (!g_micOutHintShown && g_hwnd) {
+        g_micOutHintShown = true;
+        PostMessage(g_hwnd, MICOUT_WM_STARTHINT, 0, 0);
+    }
+}
+// "Only" mode: switch the device context to the cable before creating the
+// master stream. Returns the previous context (feed to MicOutRouteEnd),
+// or -1 when routing is off / unavailable (caller falls back to speaker).
+static int MicOutRouteBegin()
+{
+    if (!g_micOutEnabled || g_micOutMode != 0) return -1;
+    int prev = BASS_GetDevice();
+    if (!MicOutEnsureDevice()) { MicOutHintOnce(); return -1; }
+    BASS_SetDevice(g_micOutDev);
+    return prev;
+}
+static void MicOutRouteEnd(int prev)
+{
+    if (prev >= 0) BASS_SetDevice(prev);
+}
+// Tap DSP (priority 0 = runs after the FX chain at 1..10, before output volume)
+static void CALLBACK MicTapDSP(HDSP, DWORD, void* buffer, DWORD length, void*)
+{
+    EnterCriticalSection(&g_micTapCs);
+    HSTREAM s = g_micTapStream;
+    if (s) {
+        DWORD avail = BASS_ChannelGetData(s, NULL, BASS_DATA_AVAILABLE);
+        if (avail == (DWORD)-1) {
+            if (++g_micTapFails == 40 && g_hwnd) PostMessage(g_hwnd, MICOUT_WM_TAPLOST, 0, 0);
+        } else if (avail > g_micTapLimit) {
+            g_micTapFails = 0;   // cable clock slower than speaker: drop to bound latency
+        } else if (BASS_StreamPutData(s, buffer, length) == (DWORD)-1) {
+            if (++g_micTapFails == 40 && g_hwnd) PostMessage(g_hwnd, MICOUT_WM_TAPLOST, 0, 0);
+        } else {
+            g_micTapFails = 0;
+        }
+    }
+    LeaveCriticalSection(&g_micTapCs);
+}
+static void MicOutStopTap()
+{
+    if (g_micTapDsp) {
+        if (currentStream) BASS_ChannelRemoveDSP(currentStream, g_micTapDsp);
+        g_micTapDsp = NULL;
+    }
+    EnterCriticalSection(&g_micTapCs);
+    HSTREAM s = g_micTapStream;
+    g_micTapStream = NULL;
+    LeaveCriticalSection(&g_micTapCs);
+    if (s) BASS_StreamFree(s);
+    g_micTapFails = 0;
+}
+// "Both" mode: mirror the master stream into a push stream on the cable device
+static void MicOutMaybeAttachTap()
+{
+    if (!g_micOutEnabled || g_micOutMode != 1 || !currentStream) return;
+    MicOutStopTap();
+    if (!MicOutEnsureDevice()) { MicOutHintOnce(); return; }
+    BASS_CHANNELINFO ci = {};
+    if (!BASS_ChannelGetInfo(currentStream, &ci)) return;
+    DWORD flags = ci.flags & (DWORD)~(BASS_STREAM_DECODE | BASS_STREAM_AUTOFREE |
+        BASS_SAMPLE_8BITS | BASS_STREAM_RESTRATE | BASS_STREAM_BLOCK | BASS_STREAM_STATUS);
+    int prev = BASS_GetDevice();
+    BASS_SetDevice(g_micOutDev);
+    HSTREAM s = BASS_StreamCreate(ci.freq, ci.chans, flags, STREAMPROC_PUSH, NULL);
+    BASS_SetDevice(prev);
+    if (!s) return;
+    EnterCriticalSection(&g_micTapCs);
+    g_micTapStream = s;
+    g_micTapLimit  = max(0x8000, (DWORD)ci.freq * ci.chans * 4);   // ~1s of float audio
+    LeaveCriticalSection(&g_micTapCs);
+    g_micTapFails = 0;
+    g_micTapDsp = BASS_ChannelSetDSP(currentStream, MicTapDSP, NULL, 0);
+    BASS_ChannelSetAttribute(s, BASS_ATTRIB_VOL, currentVolume);
+    BASS_ChannelPlay(s, FALSE);
+}
+static void MicOutPauseTap(bool pause)
+{
+    EnterCriticalSection(&g_micTapCs);
+    HSTREAM s = g_micTapStream;
+    LeaveCriticalSection(&g_micTapCs);
+    if (!s) return;
+    if (pause) BASS_ChannelPause(s);
+    else       BASS_ChannelPlay(s, FALSE);
+}
+static void MicOutUpdateTapVolume()
+{
+    EnterCriticalSection(&g_micTapCs);
+    HSTREAM s = g_micTapStream;
+    LeaveCriticalSection(&g_micTapCs);
+    if (s) BASS_ChannelSetAttribute(s, BASS_ATTRIB_VOL, currentVolume);
+}
+static void MicOutFlushTap()
+{
+    if (!g_micTapStream) return;
+    DWORD now = GetTickCount();
+    if (now - g_micTapLastFlush < 250) return;   // coalesce seek-repeat storms
+    g_micTapLastFlush = now;
+    MicOutMaybeAttachTap();                      // rebuild = drops stale queued audio
+}
+static void MicOutApplySettings(bool justEnabled)
+{
+    if (!g_micOutEnabled) { MicOutStopTap(); MicOutReleaseDevice(); return; }
+    bool wasPlaying = currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING;
+    double pos = wasPlaying ? GetPlayPos() : 0.0;
+    int curIdx = g_currentIndex;
+    MicOutStopTap();
+    if (g_micOutMode == 0 && wasPlaying) StopAudio();   // master lived on the old cable
+    MicOutReleaseDevice();
+    bool ok = MicOutEnsureDevice();
+    if (ok && g_micOutMode == 0 && wasPlaying && curIdx >= 0 && curIdx < (int)g_playlist.size()) {
+        PlayIndex(curIdx);
+        if (pos > 1.0) SeekToSeconds(pos);
+    }
+    if (ok && g_micOutMode == 1 && currentStream)
+        MicOutMaybeAttachTap();
+    if (!ok && justEnabled && g_hwnd) {
+        if (MessageBox(g_hwnd,
+            L"未检测到虚拟声卡（VB-CABLE）。\n\n"
+            L"请先下载安装免费的 VB-CABLE，安装后重启 BillyPro，\n"
+            L"程序会自动匹配 \"CABLE Input\" 设备。\n\n"
+            L"是否现在打开下载页面（vb-audio.com/Cable）？",
+            L"麦克风输出", MB_YESNO | MB_ICONWARNING) == IDYES)
+            ShellExecute(g_hwnd, L"open", L"https://vb-audio.com/Cable/", NULL, NULL, SW_SHOW);
+    }
+}
+static void MicOutStartupResolve()
+{
+    if (!g_micOutEnabled) return;
+    if (!MicOutEnsureDevice()) MicOutHintOnce();
+}
+static void MicOutShutdown()
+{
+    MicOutStopTap();
+    MicOutReleaseDevice();
+}
+
+// ============================================================
 //  Library: Favorites + Playlists (.bpp files)
 //  Stored in %APPDATA%\BillyPro\library\{favorites,playlists}\
 // ============================================================
@@ -1785,6 +2362,13 @@ void SaveSettings()
         // Keep legacy key in sync (first folder)
         WritePrivateProfileString(L"Paths", L"MediaFolder", g_mediaFolder, g_iniPath);
     }
+    WritePrivateProfileString(L"Paths", L"StartupImportDir", g_startupImportDir, g_iniPath);
+    {
+        wchar_t mb[8];
+        swprintf_s(mb, L"%d", g_micOutEnabled ? 1 : 0); WritePrivateProfileString(L"MicOut", L"Enabled", mb, g_iniPath);
+        swprintf_s(mb, L"%d", g_micOutMode);            WritePrivateProfileString(L"MicOut", L"Mode", mb, g_iniPath);
+        WritePrivateProfileString(L"MicOut", L"Device", g_micOutDeviceName, g_iniPath);
+    }
     swprintf_s(buf, L"%d", (int)g_pitchEnabled); WritePrivateProfileString(L"Pitch", L"Enabled", buf, g_iniPath);
     swprintf_s(buf, L"%.2f", g_pitchSemitones);  WritePrivateProfileString(L"Pitch", L"Semitones", buf, g_iniPath);
     swprintf_s(buf, L"%d", (int)g_rememberVolume); WritePrivateProfileString(L"UI", L"RememberVolume", buf, g_iniPath);
@@ -1897,6 +2481,12 @@ void LoadSettings()
     }
     g_rememberSession = GETI(L"UI", L"RememberSession", 0);
     if (g_rememberSession < 0 || g_rememberSession > 2) g_rememberSession = 0;
+    GetPrivateProfileString(L"Paths", L"StartupImportDir", L"", g_startupImportDir, MAX_PATH, g_iniPath);
+    g_micOutEnabled = GETI(L"MicOut", L"Enabled", 0) != 0;
+    g_micOutMode = GETI(L"MicOut", L"Mode", 1);
+    if (g_micOutMode < 0 || g_micOutMode > 1) g_micOutMode = 1;
+    GetPrivateProfileString(L"MicOut", L"Device", L"", g_micOutDeviceName, 256, g_iniPath);
+    LoadSoundHotkeys();
 #undef GETI
 #undef GETF
 }
@@ -2226,6 +2816,7 @@ void StopAudio()
     g_seekKeyHeld = false;
     // Stop recording if active
     if (g_recording) StopRecording();
+    MicOutStopTap();  // detach the mic-output tap before the master stream is freed
     // Clean up radio state
     if (g_radioPlaying) {
         g_radioPlaying = false;
@@ -2342,6 +2933,7 @@ void UpdateVolume()
 {
     if (currentStream)
         BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
+    MicOutUpdateTapVolume();
     if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
     if (hVolPct) {
         wchar_t pct[16];
@@ -2360,6 +2952,7 @@ static double GetPitchSpeedRatio()
 void SeekToSeconds(double sec)
 {
     if (!currentStream) return;
+    MicOutFlushTap();   // drop stale queued audio in the mic-output tap
     if (sec < 0) sec = 0;
     double rawSec = sec * GetPitchSpeedRatio();
 
@@ -3036,7 +3629,9 @@ void PlayIndex(int idx)
         int uLen = WideCharToMultiByte(CP_UTF8, 0, g_playlist[idx].path, -1, NULL, 0, NULL, NULL);
         std::string url8(uLen, '\0');
         WideCharToMultiByte(CP_UTF8, 0, g_playlist[idx].path, -1, &url8[0], uLen, NULL, NULL);
+        int prevDev = MicOutRouteBegin();   // "only" mode: build on the virtual cable
         HSTREAM stream = BASS_StreamCreateURL(url8.c_str(), 0, BASS_SAMPLE_FLOAT, NULL, NULL);
+        MicOutRouteEnd(prevDev);
         if (!stream) {
             wchar_t msg[MAX_PATH + 80];
             swprintf_s(msg, L"无法打开:\n%s\n\nBASS 错误: %d",
@@ -3054,6 +3649,7 @@ void PlayIndex(int idx)
         g_radioNowPlaying[0] = L'\0';
         BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
         ApplyDSP();
+        MicOutMaybeAttachTap();   // "both" mode: mirror into the cable
         BASS_ChannelPlay(currentStream, FALSE);
         SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
         SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
@@ -3072,6 +3668,7 @@ void PlayIndex(int idx)
 
     g_lastDcaDec = nullptr;
     g_lastFlacDec = nullptr;
+    int prevDev = MicOutRouteBegin();   // "only" mode: decode + master on the virtual cable
     if (IsDtsWav(g_playlist[idx].path))
         dec = CreateDtsStream(g_playlist[idx].path);
     if (dec && g_lastDcaDec) {
@@ -3094,6 +3691,7 @@ void PlayIndex(int idx)
         swprintf_s(msg, L"无法打开:\n%s\n\nBASS 错误: %d",
             g_playlist[idx].path, BASS_ErrorGetCode());
         MessageBox(g_hwnd, msg, L"播放错误", MB_ICONERROR);
+        MicOutRouteEnd(prevDev);
         return;
     }
 
@@ -3106,6 +3704,7 @@ void PlayIndex(int idx)
     // Create master output stream with GaplessProc
     currentStream = BASS_StreamCreate(ci.freq, ci.chans, BASS_SAMPLE_FLOAT,
         GaplessProc, g_hwnd);
+    MicOutRouteEnd(prevDev);
     if (!currentStream) {
         BASS_StreamFree(dec);
         g_decStream = 0;
@@ -3127,6 +3726,7 @@ void PlayIndex(int idx)
     BASS_ChannelSetSync(currentStream, BASS_SYNC_END, 0, EndSyncProc, g_hwnd);
     ApplyDSP();
     ApplyPitch();
+    MicOutMaybeAttachTap();   // "both" mode: mirror the master into the cable
     if (g_hwnd) LayoutControls(g_hwnd);
     if (hTimeTot) {
         wchar_t buf[32], tot[40];
@@ -3166,10 +3766,12 @@ void TogglePlayPause()
     }
     if (BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING) {
         BASS_ChannelPause(currentStream);
+        MicOutPauseTap(true);
         KillTimer(g_hwnd, IDT_PLAYBACK);
     }
     else {
         BASS_ChannelPlay(currentStream, FALSE);
+        MicOutPauseTap(false);
         SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
     }
     UpdatePlayBtn();
@@ -4142,6 +4744,19 @@ void ShowTrackContextMenu(HWND hwnd, int trackIdx, POINT pt)
 
     HMENU hMenu = CreatePopupMenu();
     AppendMenu(hMenu, MF_STRING, IDC_CTX_PLAY, L"播放");
+    {
+        // Soundboard: per-track hotkey binding
+        int hkIdx = FindSoundHotkey(g_ctxFilePath);
+        if (hkIdx >= 0) {
+            const SoundHotkey& hk = g_soundHotkeys[hkIdx];
+            wchar_t kt[48], mt[176];
+            FormatHotkeyText(hk.vk, hk.mods, kt, 48);
+            swprintf_s(mt, L"绑定热键...\t当前:%s·%s", kt, hk.global ? L"全局" : L"局部");
+            AppendMenu(hMenu, MF_STRING, IDC_CTX_HOTKEY, mt);
+        } else {
+            AppendMenu(hMenu, MF_STRING, IDC_CTX_HOTKEY, L"绑定热键（全局/局部）...");
+        }
+    }
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     // Favorites
     if (IsFavorite(g_ctxFilePath))
@@ -8403,6 +9018,13 @@ static void SmtcCleanup()
 #define ID_OPT_SESSION_TRACK  656
 #define ID_OPT_SESSION_SEEK   657
 #define ID_OPT_DROP_LOADDIR   658
+#define ID_OPT_STARTUP_DIR    659
+#define ID_OPT_STARTUP_BROWSE 660
+#define ID_OPT_MICOUT_ENABLE   661
+#define ID_OPT_MICOUT_ONLY     662
+#define ID_OPT_MICOUT_BOTH     663
+#define ID_OPT_MICOUT_COMBO    664
+#define ID_OPT_MICOUT_STATUS   665
 
 static HWND s_optPanels[6] = {};
 static int  s_optPage = 0;
@@ -8573,6 +9195,11 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 L"记住播放列表和曲目", g_rememberSession == 1);
             rad(p, 10, 348, w - 20, 20, ID_OPT_SESSION_SEEK,
                 L"记住播放列表、曲目和进度位置", g_rememberSession == 2);
+
+            grp(p, 0, 392, w, 96, L"启动导入");
+            lbl(p, 10, 412, w - 20, 16, L"启动时自动导入此文件夹（留空则不导入）:");
+            edt(p, 10, 432, w - 104, 20, ID_OPT_STARTUP_DIR, g_startupImportDir);
+            btn(p, w - 90, 431, 80, 22, ID_OPT_STARTUP_BROWSE, L"浏览...");
         }
 
         // ── Page 1: Display ───────────────────────────────────────────────
@@ -8697,6 +9324,52 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             edt(p, 82, 190, w - 126, 22, ID_OPT_REC_PATH, g_recSaveDir);
             btn(p, w - 40, 190, 36, 22, ID_OPT_REC_BROWSE, L"...");
             lbl(p, 10, 218, w - 20, 32, L"录制为 FLAC（无损）。\r\n留空则每次询问。");
+
+            // Microphone output (soundboard → virtual cable)
+            grp(p, 0, 276, w, 198, L"麦克风输出（虚拟声卡）");
+            chk(p, 10, 296, w - 20, 20, ID_OPT_MICOUT_ENABLE, L"启用麦克风输出（把声音送入虚拟声卡）", g_micOutEnabled);
+            { HWND h = rad(p, 10, 320, w - 20, 20, ID_OPT_MICOUT_ONLY,
+                L"仅输出到虚拟声卡（本机扬声器静音）", g_micOutMode == 0);
+              SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
+            rad(p, 10, 340, w - 20, 20, ID_OPT_MICOUT_BOTH,
+                L"扬声器和虚拟声卡同时输出", g_micOutMode == 1);
+            lbl(p, 10, 370, 76, 16, L"输出设备:");
+            {
+                HWND hMicCombo = CreateWindow(L"COMBOBOX", L"",
+                    WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS,
+                    88, 366, w - 98, 200, p, (HMENU)ID_OPT_MICOUT_COMBO, hInst, NULL);
+                SendMessage(hMicCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+                BASS_DEVICEINFO mdi; int msel = -1, mcnt = 0;
+                for (int d = 1; BASS_GetDeviceInfo(d, &mdi); d++) {
+                    if (!(mdi.flags & BASS_DEVICE_ENABLED)) continue;
+                    wchar_t wn[256];
+                    MultiByteToWideChar(CP_ACP, 0, mdi.name, -1, wn, 256);
+                    int ix = (int)SendMessage(hMicCombo, CB_ADDSTRING, 0, (LPARAM)wn);
+                    SendMessage(hMicCombo, CB_SETITEMDATA, ix, (LPARAM)d);
+                    if (g_micOutDeviceName[0]) { if (_wcsicmp(wn, g_micOutDeviceName) == 0) msel = mcnt; }
+                    else if (MicOutNameMatches(mdi.name)) msel = mcnt;
+                    mcnt++;
+                }
+                if (msel >= 0) SendMessage(hMicCombo, CB_SETCURSEL, msel, 0);
+            }
+            {
+                wchar_t mstat[320];
+                int md = g_micOutEnabled ? MicOutFindDevice() : -1;
+                if (!g_micOutEnabled)
+                    swprintf_s(mstat, L"当前未启用。启用后如未检测到虚拟声卡会在此提示。");
+                else if (md >= 0) {
+                    BASS_DEVICEINFO mdi = {};
+                    BASS_GetDeviceInfo(md, &mdi);
+                    wchar_t mn[256] = L"?";
+                    MultiByteToWideChar(CP_ACP, 0, mdi.name, -1, mn, 256);
+                    swprintf_s(mstat, L"已连接: %s", mn);
+                } else
+                    swprintf_s(mstat, L"⚠ 未检测到 VB-CABLE / Virtual Cable 虚拟声卡");
+                HWND hMicStat = CreateWindow(L"STATIC", mstat, WS_CHILD|WS_VISIBLE|SS_LEFT,
+                    10, 392, w - 20, 32, p, (HMENU)ID_OPT_MICOUT_STATUS, hInst, NULL);
+                SendMessage(hMicStat, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+            }
+            lbl(p, 10, 428, w - 20, 40, L"用法: 在 QQ / 微信 / OBS 等软件里把输入（麦克风）\r\n设备选为 “CABLE Output”。没装? 到 vb-audio.com/Cable\r\n免费下载 VB-CABLE。");
         }
 
         // ── Page 4: Media ─────────────────────────────────────────────────
@@ -8773,6 +9446,13 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             }
             break;
 
+        case ID_OPT_STARTUP_BROWSE: {
+            wchar_t folder[MAX_PATH] = {};
+            GetDlgItemTextW(hwnd, ID_OPT_STARTUP_DIR, folder, MAX_PATH);
+            if (PickFolder(hwnd, L"选择启动导入的文件夹", folder, MAX_PATH))
+                SetDlgItemTextW(hwnd, ID_OPT_STARTUP_DIR, folder);
+            break;
+        }
         case ID_OPT_MEDIA_ADD: {
             wchar_t folder[MAX_PATH] = {};
             if (PickFolder(hwnd, L"选择媒体文件夹", folder, MAX_PATH)) {
@@ -8892,6 +9572,7 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
         case ID_OPT_SAVE: {
             wchar_t buf[32];
+            bool wasMicEnabled = g_micOutEnabled;
             // Audio page
             GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_LOW),  buf, 32); float lo = (float)_wtof(buf);
             GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_HIGH), buf, 32); float hi = (float)_wtof(buf);
@@ -8945,6 +9626,30 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 g_rememberSession = 1;
             else
                 g_rememberSession = 0;
+            // Startup import folder (trim quotes / trailing backslashes, keep "C:\")
+            {
+                wchar_t tmpDir[MAX_PATH];
+                GetDlgItemText(s_optPanels[0], ID_OPT_STARTUP_DIR, tmpDir, MAX_PATH);
+                wchar_t* dirStr = tmpDir;
+                size_t dirLen = wcslen(dirStr);
+                if (dirLen >= 2 && dirStr[0] == L'"' && dirStr[dirLen - 1] == L'"') { dirStr[dirLen - 1] = L'\0'; dirStr++; }
+                dirLen = wcslen(dirStr);
+                while (dirLen > 3 && dirStr[dirLen - 1] == L'\\') dirStr[--dirLen] = L'\0';
+                wcsncpy_s(g_startupImportDir, dirStr, _TRUNCATE);
+            }
+            // Microphone output
+            g_micOutEnabled = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
+            g_micOutMode = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_BOTH), BM_GETCHECK,0,0)==BST_CHECKED) ? 1 : 0;
+            {
+                HWND hMicC = GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_COMBO);
+                int msel = (int)SendMessage(hMicC, CB_GETCURSEL, 0, 0);
+                if (msel != CB_ERR) {
+                    wchar_t mn[256] = L"";
+                    SendMessage(hMicC, CB_GETLBTEXT, msel, (LPARAM)mn);
+                    wcsncpy_s(g_micOutDeviceName, mn, _TRUNCATE);
+                } else
+                    g_micOutDeviceName[0] = L'\0';
+            }
             // Device page
             if (s_optPanels[3])
                 g_rememberVolume = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_REMEMBER_VOL), BM_GETCHECK,0,0)==BST_CHECKED);
@@ -8989,6 +9694,7 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     }
                 }
             }
+            MicOutApplySettings(g_micOutEnabled && !wasMicEnabled);
             SaveSettings();
             DestroyWindow(hwnd);
             break;
@@ -9006,6 +9712,7 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 DeleteFile(g_iniPath);
                 g_iniPath[0] = L'\0';
                 LoadSettings();
+                RegisterAllSoundHotkeys(g_hwnd);
                 // Apply all effects
                 ApplyDSP();
                 ApplyPitch();
@@ -9033,7 +9740,12 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)wParam;
-        SetTextColor(dc, g_theme.text);
+        if (msg == WM_CTLCOLORSTATIC && s_optPanels[3] && g_micOutEnabled
+            && (HWND)lParam == GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_STATUS)
+            && MicOutFindDevice() < 0)
+            SetTextColor(dc, RGB(232, 88, 88));   // cable missing — red hint
+        else
+            SetTextColor(dc, g_theme.text);
         SetBkColor(dc, g_theme.bg);
         return (LRESULT)g_brBg;
     }
@@ -10600,6 +11312,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         RegisterHotKey(hwnd, ID_HOTKEY_NEXT,      0, VK_MEDIA_NEXT_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_PREV,      0, VK_MEDIA_PREV_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_STOP,      0, VK_MEDIA_STOP);
+        // Register per-sound global hotkeys (soundboard)
+        RegisterAllSoundHotkeys(hwnd);
+
+        // Resolve the mic-output (virtual cable) device at startup
+        MicOutStartupResolve();
 
         // Taskbar thumbnail toolbar (Win7+)
         g_WM_TASKBARBUTTONCREATED = RegisterWindowMessage(L"TaskbarButtonCreated");
@@ -11002,12 +11719,34 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     }
 
+    case MICOUT_WM_TAPLOST:
+        // Virtual cable vanished mid-playback — drop the tap, speaker keeps playing
+        MicOutStopTap();
+        g_micOutDev = -1;
+        break;
+
+    case MICOUT_WM_STARTHINT:
+        if (g_micOutEnabled && !MicOutDevReady() && !g_micOutMissingShown) {
+            g_micOutMissingShown = true;
+            if (MessageBox(hwnd,
+                L"已启用麦克风输出，但未检测到虚拟声卡（VB-CABLE）。\n\n"
+                L"请下载安装免费的 VB-CABLE 后重启 BillyPro；安装后程序会自动匹配 \"CABLE Input\" 设备。\n\n"
+                L"是否现在打开下载页面（vb-audio.com/Cable）？",
+                L"麦克风输出", MB_YESNO | MB_ICONWARNING) == IDYES)
+                ShellExecute(hwnd, L"open", L"https://vb-audio.com/Cable/", NULL, NULL, SW_SHOW);
+        }
+        break;
+
     case WM_HOTKEY:
         switch ((int)wParam) {
         case ID_HOTKEY_PLAYPAUSE: TogglePlayPause(); break;
         case ID_HOTKEY_NEXT:      PlayNext();        break;
         case ID_HOTKEY_PREV:      PlayPrev();        break;
         case ID_HOTKEY_STOP:      StopAudio();       break;
+        default:
+            if ((int)wParam >= ID_HOTKEY_SND_BASE && (int)wParam < ID_HOTKEY_SND_BASE + SNDHK_MAX)
+                TriggerSoundHotkey((int)wParam - ID_HOTKEY_SND_BASE);
+            break;
         }
         UpdateThumbButtons();
         break;
@@ -11334,6 +12073,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (g_ctxTrackIndex >= 0) PlayIndex(g_ctxTrackIndex);
             }
             break;
+        case IDC_CTX_HOTKEY:
+            if (!g_ctxIsBrowser && g_ctxFilePath[0]) OpenHotkeyBindDialog(g_ctxFilePath);
+            break;
         case IDC_CTX_REMOVE: {
             // Collect all selected items
             int total = (int)SendMessage(hListBox, LB_GETCOUNT, 0, 0);
@@ -11615,6 +12357,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // Format mismatch — next track has different sample rate or channels.
             // g_decNext still holds the pre-loaded decode stream.
             // Stop the current master and do a full PlayIndex using g_decNext.
+            MicOutStopTap();
             if (currentStream) { BASS_StreamFree(currentStream); currentStream = 0; }
             // g_decStream already cleared by GaplessProc
             int nextIdx = g_decNextIdx;
@@ -11650,14 +12393,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 BASS_CHANNELINFO ci = {};
                 BASS_ChannelGetInfo(dec, &ci);
                 g_decStream = dec;
+                int prevDev = MicOutRouteBegin();
                 currentStream = BASS_StreamCreate(ci.freq, ci.chans, BASS_SAMPLE_FLOAT,
                     GaplessProc, g_hwnd);
+                MicOutRouteEnd(prevDev);
                 g_masterFreq  = ci.freq;
                 g_masterChans = ci.chans;
                 if (currentStream) {
                     ApplyDSP();
                     ApplyPitch();
                     UpdateVolume();
+                    MicOutMaybeAttachTap();
                     BASS_ChannelPlay(currentStream, FALSE);
                     SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
                 }
@@ -11737,12 +12483,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
         if (g_decStream) { BASS_StreamFree(g_decStream); g_decStream = 0; }
         if (currentStream) { BASS_ChannelStop(currentStream); BASS_StreamFree(currentStream); }
+        MicOutShutdown();   // free the mic-output tap and the cable device
         BASS_Free();
         // Unregister media key hotkeys
         UnregisterHotKey(hwnd, ID_HOTKEY_PLAYPAUSE);
         UnregisterHotKey(hwnd, ID_HOTKEY_NEXT);
         UnregisterHotKey(hwnd, ID_HOTKEY_PREV);
         UnregisterHotKey(hwnd, ID_HOTKEY_STOP);
+        // Unregister soundboard hotkey slots
+        for (int i = 0; i < SNDHK_MAX; i++) UnregisterHotKey(hwnd, ID_HOTKEY_SND_BASE + i);
         // Release SMTC
         SmtcCleanup();
         // Release taskbar thumbnail
@@ -11995,6 +12744,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         }
     }
 
+    // Soundboard: import the configured startup folder on every launch (deduped)
+    if (g_startupImportDir[0] &&
+        GetFileAttributesW(g_startupImportDir) != INVALID_FILE_ATTRIBUTES)
+        ImportStartupFolder();
+
     // Sync column view now that playlist is loaded
     if (g_columnView) SyncColumnView();
 
@@ -12009,6 +12763,19 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         //  so Space/F/N/P/S/R/Up/Down work regardless of focus.
         //  Left/Right are forwarded to main WndProc for seek.
         // ────────────────────────────────────────────────────
+        // Soundboard: local (in-app) hotkeys, before built-in key handling so
+        // user-bound combos take precedence. Never while typing in an edit.
+        if ((msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && !IsTypingFocus()) {
+            UINT lmod = 0;
+            if (GetKeyState(VK_CONTROL) & 0x8000) lmod |= MOD_CONTROL;
+            if (GetKeyState(VK_MENU)    & 0x8000) lmod |= MOD_ALT;
+            if (GetKeyState(VK_SHIFT)   & 0x8000) lmod |= MOD_SHIFT;
+            if ((((USHORT)GetKeyState(VK_LWIN)) | ((USHORT)GetKeyState(VK_RWIN))) & 0x8000) lmod |= MOD_WIN;
+            if (!(msg.lParam & (1 << 30))) {          // ignore auto-repeat
+                int slot = MatchLocalSoundHotkey((UINT)msg.wParam, lmod);
+                if (slot >= 0) { TriggerSoundHotkey(slot); continue; }
+            }
+        }
         if (msg.message == WM_KEYDOWN) {
             HWND focusWnd = GetFocus();
             // Don't steal keys when any dialog (info, options, convert) or search has focus
