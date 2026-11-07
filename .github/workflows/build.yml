@@ -8,24 +8,26 @@ jobs:
       
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
-
+        
       - name: Auto Fix Source and FLAC
         shell: pwsh
         run: |
-          # 1. 使用自带的 curl 和 tar 下载并解压 FLAC (速度最快，最稳)
+          # 1. 下载 FLAC 源码包
           curl.exe -L -o flac.zip https://github.com/xiph/flac/archive/refs/tags/1.4.3.zip
-          tar.exe -xf flac.zip
           
-          # 2. 将头文件夹整体复制到当前目录 (生成 FLAC 文件夹)
+          # 2. 使用 PowerShell 原生解压
+          Expand-Archive -Path "flac.zip" -DestinationPath "." -Force
+          
+          # 3. 将头文件夹复制到当前目录 (生成 FLAC 文件夹)
           if (Test-Path "FLAC") { Remove-Item -Path "FLAC" -Recurse -Force }
           Copy-Item -Path "flac-1.4.3\include\FLAC" -Destination "." -Recurse -Force
           
-          # 3. 处理 BOM 问题
+          # 4. 清理 BillyPro.cpp 的隐藏 BOM 字符
           $content = Get-Content "BillyPro.cpp" -Raw
           $content = $content.TrimStart([char]0xFEFF)
           [System.IO.File]::WriteAllText("$PWD\BillyPro.cpp", $content, [System.Text.Encoding]::UTF8)
 
-          # 4. 强制 utf-8 编译配置文件
+          # 5. 强制编译器使用 UTF-8
           $props = @"
           <Project>
             <ItemDefinitionGroup>
