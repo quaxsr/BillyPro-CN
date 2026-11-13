@@ -1463,19 +1463,24 @@ static bool MicOutEnsureDevice()
     g_micOutDev = idx;
     BASS_DEVICEINFO di = {};
     BASS_GetDeviceInfo(idx, &di);
+    int prevCtx = BASS_GetDevice();   // BASS_Init 会切换当前设备上下文，完成后必须切回主输出
     if (!(di.flags & BASS_DEVICE_INIT) && !BASS_Init(idx, 48000, 0, NULL, NULL)) {
+        BASS_SetDevice(prevCtx);
         g_micOutDev = -1;
         return false;
     }
+    BASS_SetDevice(prevCtx);
     return true;
 }
 static void MicOutReleaseDevice()
 {
     if (g_micOutDev <= 0) return;
+    int prevCtx = BASS_GetDevice();   // 记住主设备，释放声卡后切回
     BASS_DEVICEINFO di = {};
     bool inited = BASS_GetDeviceInfo(g_micOutDev, &di) && (di.flags & BASS_DEVICE_INIT);
-    bool isSpeaker = ((DWORD)g_micOutDev == BASS_GetDevice());
+    bool isSpeaker = ((DWORD)g_micOutDev == (DWORD)prevCtx);
     if (inited && !isSpeaker) { BASS_SetDevice(g_micOutDev); BASS_Free(); }
+    if (prevCtx > 0) BASS_SetDevice(prevCtx);
     g_micOutDev = -1;
 }
 static void MicOutHintOnce()
@@ -2004,6 +2009,32 @@ static void LoadBppIntoPlaylist(int plIdx)
     if (hm) CheckMenuItem(hm, IDM_LIB_FAVORITES, MF_BYCOMMAND | MF_UNCHECKED);
 }
 
+// ── 主输出设备（按显示名持久化；空 = 系统默认）─────────────────────────
+// 刻意与麦克风输出（虚拟声卡）的 [MicOut] Device 完全分开，互不干扰。
+static wchar_t g_outDeviceName[256] = L"";   // [Output] Device
+
+// 启动时（LoadSettings 之后）切到已保存的主输出设备。
+static void ApplyStoredOutDevice()
+{
+    if (!g_outDeviceName[0]) return;
+    BASS_DEVICEINFO di = {};
+    for (int d = 1; BASS_GetDeviceInfo(d, &di); d++) {
+        if (!(di.flags & BASS_DEVICE_ENABLED)) continue;
+        wchar_t wn[256];
+        if (!MultiByteToWideChar(CP_ACP, 0, di.name, -1, wn, 256)) continue;
+        if (_wcsicmp(wn, g_outDeviceName) == 0) {
+            if ((DWORD)d == BASS_GetDevice()) return;   // 已是当前设备
+            BASS_Free();
+            if (!BASS_Init(d, 44100, 0, g_hwnd, NULL)) {
+                g_outDeviceName[0] = L'\0';             // 设备已不在，回退默认
+                BASS_Init(-1, 44100, 0, g_hwnd, NULL);
+            }
+            return;
+        }
+    }
+    g_outDeviceName[0] = L'\0';   // 存储的设备不存在，回退默认
+}
+
 void SaveSettings()
 {
     GetIniPath();
@@ -2047,6 +2078,8 @@ void SaveSettings()
         // Keep legacy key in sync (first folder)
         WritePrivateProfileString(L"Paths", L"MediaFolder", g_mediaFolder, g_iniPath);
     }
+    // 主输出设备 — 独立 INI 节，绝不与 [MicOut] Device 混用
+    WritePrivateProfileString(L"Output", L"Device", g_outDeviceName, g_iniPath);
     {
         wchar_t mb[8];
         swprintf_s(mb, L"%d", g_micOutEnabled ? 1 : 0); WritePrivateProfileString(L"MicOut", L"Enabled", mb, g_iniPath);
@@ -2148,6 +2181,7 @@ void LoadSettings()
     g_micOutEnabled = GETI(L"MicOut", L"Enabled", 0) != 0;
     g_micOutMode = GETI(L"MicOut", L"Mode", 1);
     if (g_micOutMode < 0 || g_micOutMode > 1) g_micOutMode = 1;
+    GetPrivateProfileString(L"Output", L"Device", L"", g_outDeviceName, 256, g_iniPath);
     GetPrivateProfileString(L"MicOut", L"Device", L"", g_micOutDeviceName, 256, g_iniPath);
     LoadSoundHotkeys();
 #undef GETI
@@ -8108,9 +8142,10 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS,
                 10, 38, w - 20, 200, p, (HMENU)ID_OPT_DEVICE_COMBO, hInst, NULL);
             SendMessage(hCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-            // Enumerate BASS devices
+            // Enumerate BASS devices — 优先按已保存的主输出设备名预选，
+            // 仅在无存值时才回退到 BASS 当前设备上下文（防止被麦克风模块污染）
             BASS_DEVICEINFO di;
-            int selIdx = 0, devCount = 0;
+            int selIdx = -1, curIdx = -1, devCount = 0;
             DWORD curDev = BASS_GetDevice();
             for (int d = 1; BASS_GetDeviceInfo(d, &di); d++) {
                 if (di.flags & BASS_DEVICE_ENABLED) {
@@ -8118,10 +8153,12 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     MultiByteToWideChar(CP_ACP, 0, di.name, -1, wname, 256);
                     int idx = (int)SendMessage(hCombo, CB_ADDSTRING, 0, (LPARAM)wname);
                     SendMessage(hCombo, CB_SETITEMDATA, idx, (LPARAM)d);
-                    if ((DWORD)d == curDev) selIdx = devCount;
+                    if ((DWORD)d == curDev) curIdx = devCount;
+                    if (g_outDeviceName[0] && _wcsicmp(wname, g_outDeviceName) == 0) selIdx = devCount;
                     devCount++;
                 }
             }
+            if (selIdx < 0) selIdx = (curIdx >= 0 ? curIdx : 0);
             if (devCount > 0) SendMessage(hCombo, CB_SETCURSEL, selIdx, 0);
             btn(p, 10, 68, w - 20, 26, ID_OPT_DEVICE_RESET, L"重置声卡驱动混音器");
 
@@ -8304,9 +8341,14 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             StopAudio();
             // Switch device
             BASS_Free();
-            if (!BASS_Init(devIdx, 44100, 0, g_hwnd, NULL)) {
+            if (BASS_Init(devIdx, 44100, 0, g_hwnd, NULL)) {
+                wchar_t dn[256] = L"";
+                SendMessage(hCombo, CB_GETLBTEXT, sel, (LPARAM)dn);
+                wcsncpy_s(g_outDeviceName, dn, _TRUNCATE);   // 记录主输出选择
+            } else {
                 // Fallback to default device
                 BASS_Init(-1, 44100, 0, g_hwnd, NULL);
+                g_outDeviceName[0] = L'\0';
                 MessageBox(hwnd, L"切换设备失败，已改用默认设备。", L"设备", MB_ICONWARNING);
             }
             // Restart playback at saved position
@@ -8392,8 +8434,14 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                         bool wasPlaying = currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING;
                         StopAudio();
                         BASS_Free();
-                        if (!BASS_Init(devIdx, 44100, 0, g_hwnd, NULL))
+                        if (BASS_Init(devIdx, 44100, 0, g_hwnd, NULL)) {
+                            wchar_t dn[256] = L"";
+                            SendMessage(hCombo, CB_GETLBTEXT, sel, (LPARAM)dn);
+                            wcsncpy_s(g_outDeviceName, dn, _TRUNCATE);   // 持久化主输出选择
+                        } else {
                             BASS_Init(-1, 44100, 0, g_hwnd, NULL);
+                            g_outDeviceName[0] = L'\0';                  // 已回退默认设备
+                        }
                         if (savedIdx >= 0 && savedIdx < (int)g_playlist.size()) {
                             PlayIndex(savedIdx);
                             if (savedPos > 1.0) SeekToSeconds(savedPos);
@@ -9938,6 +9986,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         LoadSettings();
         LoadFavorites();
         ApplyTheme();  // re-apply after LoadSettings so dark mode is applied on startup
+        ApplyStoredOutDevice();   // 切到已保存的主输出设备（必须在麦克风模块解析之前）
         DragAcceptFiles(hwnd, TRUE);
         LayoutControls(hwnd);
         UpdateVolume();
