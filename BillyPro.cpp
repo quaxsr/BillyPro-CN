@@ -37,6 +37,7 @@ extern "C" {
 
 
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Imm32.lib")
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "winmm.lib")
@@ -49,6 +50,7 @@ extern "C" {
 #include <winhttp.h>
 #include <dwmapi.h>
 #include <shobjidl.h>
+#include <imm.h>
 
 // SMTC (System Media Transport Controls) for lock screen / media overlay
 #include <winrt/base.h>
@@ -75,14 +77,9 @@ extern "C" {
 #define ID_STATUSBAR        120
 #define ID_BTN_SHUFFLE      121
 #define ID_BTN_REPEAT       122
-#define ID_BTN_MONO         123
-#define ID_BTN_NORMALIZE    124
-#define ID_BTN_BASSBOOST    125
 #define ID_BTN_MEDIA        126
-#define ID_BTN_DSP          127
 #define ID_BTN_RECORD       129
 #define ID_BTN_BACK         128
-#define IDM_HELP_CONTROLS   2302
 #define IDM_OPTIONS         2401
 #define IDM_OPTIONS_SHOW    2402
 
@@ -151,25 +148,6 @@ extern "C" {
 #define ID_DCG_ARTWORK      430
 #define ID_DCG_FILLALL      431
 
-// Convert dialog
-#define IDM_FILE_CONVERT    2004
-#define ID_CONV_LIST        501
-#define ID_CONV_ADDFOLDER   502
-#define ID_CONV_ADDPLAYLIST 503
-#define ID_CONV_REMOVE      504
-#define ID_CONV_OUTDIR      505
-#define ID_CONV_BROWSE      506
-#define ID_CONV_FORMAT      507
-#define ID_CONV_QUALITY     508
-#define ID_CONV_START       509
-#define ID_CONV_CLOSE       510
-#define ID_CONV_PROGRESS    511
-#define ID_CONV_STATUS      512
-#define ID_CONV_SELECTALL   513
-#define ID_CONV_NORMALIZE   514
-#define ID_CONV_METADATA    515
-#define ID_CONV_SRATE       516
-
 #define IDT_PLAYBACK        1
 #define IDT_SEEK_REPEAT     2
 #define IDT_PEAK_DECAY      3   // volume peak meter decay
@@ -182,8 +160,6 @@ extern "C" {
 #define IDT_STATUS_SCROLL   5   // status bar text scroll
 #define WM_PLAYNEXT         (WM_APP + 1)
 #define WM_TRAYICON         (WM_APP + 2)
-#define WM_CONV_PROGRESS    (WM_APP + 3)   // wParam=files done, lParam=MAKELPARAM(fileIdx,total)
-#define WM_CONV_DONE        (WM_APP + 4)   // wParam=ok count, lParam=total
 #define ID_TRAY_RESTORE     601
 #define ID_TRAY_EXIT        602
 #ifndef IDC_STATIC
@@ -198,16 +174,11 @@ extern "C" {
 #define IDM_PLAY_PREV       2104
 #define IDM_PLAY_SHUFFLE    2105
 #define IDM_PLAY_REPEAT     2106
-#define IDM_HELP_ABOUT      2301
-#define IDM_HELP_UPDATE     2303
 // View menu
 #define IDM_VIEW_COLUMNS        2203
 #define ID_COLUMNVIEW           131
 #define IDM_VIEW_DARKMODE       2201
 #define IDM_VIEW_MODERN         2202
-// M3U playlist
-#define IDM_FILE_OPENM3U        2005
-#define IDM_FILE_SAVEM3U        2006
 // Options extras
 #define IDM_OPTIONS_FILEASSOC   2403
 #define IDM_OPTIONS_MULTIINST   2404
@@ -277,9 +248,6 @@ HWND hStopBtn = NULL;
 HWND hNextBtn = NULL;
 HWND hShuffleBtn = NULL;
 HWND hRepeatBtn = NULL;
-HWND hMonoBtn = NULL;
-HWND hNormalizeBtn = NULL;
-HWND hBassBoostBtn = NULL;
 HWND hMediaBtn     = NULL;
 HWND hVolumeCanvas = NULL;
 HWND hSeekCanvas = NULL;
@@ -298,10 +266,7 @@ wchar_t g_discogsToken[128] = L"";  // Discogs personal access token
 bool    g_shuffle = false;
 // Repeat mode: 0=off, 1=repeat track, 2=repeat playlist, 3=play once (stop after current)
 int     g_repeatMode = 0;
-bool    g_mono = false;
-bool    g_normalize = false;
 wchar_t g_iniPath[MAX_PATH] = L"";
-bool    g_bassBoost = false;
 // Remember session: 0=off, 1=playlist+track only, 2=playlist+track+seek position
 int     g_rememberSession = 0;
 wchar_t g_mediaFolder[MAX_PATH] = L"";   // first folder (kept in sync with g_mediaFolders[0])
@@ -309,39 +274,10 @@ std::vector<std::wstring> g_mediaFolders; // all configured media root folders
 bool    g_mediaActive = false;
 bool    g_pitchEnabled = false;
 float   g_pitchSemitones = 0.0f;  // -12 to +12 semitones (CDJ-style: changes pitch + tempo)
-float   g_bbFreqLow = 30.0f;   // Hz
-float   g_bbFreqHigh = 100.0f;  // Hz
-float   g_bbGainDB = 5.0f;    // dB
 // Recording
 wchar_t g_recOutDir[MAX_PATH] = L"";
 // Extra DSP effects
-bool  g_dspReverb   = false;
-bool  g_dspSaturate = false;
-bool  g_dspVinyl    = false;
-bool  g_dspHifi     = false;
-bool  g_dspBypass   = false;   // true = DSP button bypasses all extra effects
-HWND  hDspBtn       = NULL;
 HWND  hBackBtn      = NULL;
-// Reverb params
-float g_revMix    = 8.0f;    // 0-100  wet %
-float g_revRoom   = 75.0f;   // 0-100  room size (maps to feedback 0.5-0.96)
-float g_revWidth  = 80.0f;   // 0-100  stereo width (0=mono reverb, 100=full stereo)
-// Saturation params
-float g_satDrive  = 1.6f;    // 1.0-5.0  drive
-float g_satLevel  = 72.0f;   // 0-100  output level %
-// Vinyl params
-float g_vinLpFreq = 17500.0f; // 2000-20000 Hz  LP cutoff
-float g_vinCrackle= 15.0f;   // 0-100  crackle amount
-// HiFi Amplifier params
-float g_hfiBassDb = 3.0f;    // 0-12 dB  bass shelf boost
-float g_hfiWarmth = 33.0f;   // 0-100  tube saturation %
-// DSP handles
-HDSP    g_dspMono   = 0;
-HDSP    g_dspBass   = 0;
-HDSP    g_dspRevHdl = 0;
-HDSP    g_dspSatHdl = 0;
-HDSP    g_dspVinHdl = 0;
-HDSP    g_dspHfiHdl = 0;
 
 // Gapless playback: decode streams fed into a master output via STREAMPROC
 static HSTREAM g_decStream  = 0;     // current decode stream (BASS_STREAM_DECODE)
@@ -423,11 +359,6 @@ static int   g_lbDragCur = -1;
 static bool  g_lbDragMoved = false;  // did mouse move enough to be a drag?
 
 HWND   g_hwndInfo = NULL;   // audio info window
-HWND   g_hwndConvert = NULL; // convert window
-static HANDLE g_convThread    = NULL;
-static bool   g_convRunning   = false;
-static bool   g_convAbort     = false;
-static DWORD  g_convStartTick = 0;
 bool   g_trayAdded    = false;   // system tray icon active
 bool   g_darkMode     = false;   // dark theme enabled
 bool   g_modernStyle  = false;  // modern style: artwork thumbnails in playlist
@@ -562,7 +493,6 @@ void OpenAudioInfoDialog(int trackIdx);
 void OpenAudioInfoForPath(const wchar_t* path);
 void ShowTrackContextMenu(HWND hwnd, int trackIdx, POINT pt);
 LRESULT CALLBACK SearchWndProc(HWND, UINT, WPARAM, LPARAM);
-void OpenConvertDialog();
 void OpenFileAssocDialog();
 void OpenOptionsDialog();
 void UpdateThumbButtons();
@@ -860,338 +790,6 @@ void LoadFolder(const wchar_t* folder)
     UpdateStatusBar();
 }
 
-// ============================================================
-//  DSP: Mono mix-down
-// ============================================================
-void CALLBACK DSP_Mono(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    // Get actual channel count from the stream
-    BASS_CHANNELINFO ci = {};
-    BASS_ChannelGetInfo(channel, &ci);
-    int nch = ci.chans;
-    if (nch < 2) return; // already mono, nothing to do
-
-    float* buf = (float*)buffer;
-    DWORD floats = length / sizeof(float);
-    // Mix all channels to mono, write back to all channels
-    for (DWORD i = 0; i + (DWORD)nch <= floats; i += nch) {
-        float m = 0;
-        for (int c = 0; c < nch; c++) m += buf[i + c];
-        m /= nch;
-        for (int c = 0; c < nch; c++) buf[i + c] = m;
-    }
-}
-
-// DSP: Bass boost with soft clip limiter
-// 1-pole low-pass IIR state (stereo)
-static float s_lpL = 0.0f, s_lpR = 0.0f;
-// Limiter envelope follower
-static float s_limGain = 1.0f;
-
-void CALLBACK DSP_BassBoost(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    float* buf = (float*)buffer;
-    DWORD floats = length / sizeof(float);
-    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
-    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
-    int nch = ci.chans > 0 ? ci.chans : 2;
-    float alpha = expf(-6.28318f * 120.0f / sr);
-    float bassGain = powf(10.0f, g_bbGainDB / 20.0f) - 1.0f;
-    const float limAttack = 0.001f;
-    const float limRelease = 0.00001f;
-    const float limThresh = 0.95f;
-
-    for (DWORD i = 0; i + (DWORD)nch <= floats; i += nch) {
-        // Process L (ch0) and R (ch1 if present), pass through extra channels
-        s_lpL = alpha * s_lpL + (1.0f - alpha) * buf[i];
-        float outL = buf[i] + s_lpL * bassGain;
-        float outR = outL;
-        if (nch >= 2) {
-            s_lpR = alpha * s_lpR + (1.0f - alpha) * buf[i + 1];
-            outR = buf[i + 1] + s_lpR * bassGain;
-        }
-        float peak = max(fabsf(outL), nch >= 2 ? fabsf(outR) : 0.0f);
-        if (peak * s_limGain > limThresh && peak > 0.0f) {
-            float targetGain = limThresh / peak;
-            s_limGain += (targetGain - s_limGain) * limAttack;
-            if (s_limGain > targetGain) s_limGain = targetGain;
-        } else {
-            s_limGain += (1.0f - s_limGain) * limRelease;
-            if (s_limGain > 1.0f) s_limGain = 1.0f;
-        }
-        buf[i] = outL * s_limGain;
-        if (nch >= 2) buf[i + 1] = outR * s_limGain;
-        // Extra channels (surround) get limiter gain only
-        for (int c = 2; c < nch; c++) buf[i + c] *= s_limGain;
-    }
-}
-
-// ============================================================
-//  Extra DSP effects
-// ============================================================
-
-// --- Reverb (4 comb + 2 all-pass per channel, Freeverb stereo) ---
-// Base delay lengths at 44100 Hz — scaled at runtime for other sample rates
-static const int REV_COMB_BASE_L[4] = { 1557, 1617, 1491, 1422 };
-static const int REV_COMB_BASE_R[4] = { 1580, 1640, 1514, 1445 }; // +23 Freeverb offset
-static const int REV_AP_BASE_L[2]   = { 225, 341 };
-static const int REV_AP_BASE_R[2]   = { 236, 352 };                // +11 offset
-// Buffers sized for up to 192 kHz (max scale ~4.35x of base lengths)
-static float g_revCombBufL[4][7200]={}, g_revCombBufR[4][7200]={};
-static float g_revApBufL[2][1600]={},   g_revApBufR[2][1600]={};
-static int   g_revCombPosL[4]={}, g_revCombPosR[4]={};
-static int   g_revApPosL[2]={},   g_revApPosR[2]={};
-
-void CALLBACK DSP_Reverb(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    float* buf  = (float*)buffer;
-    DWORD  n    = length / sizeof(float);
-    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
-    float srScale = ci.freq > 0 ? (float)ci.freq / 44100.0f : 1.0f;
-    int nch = ci.chans > 0 ? ci.chans : 2;
-
-    // Scale delay lengths by sample rate, clamped to buffer sizes
-    int combL[4], combR[4], apL[2], apR[2];
-    for (int c = 0; c < 4; c++) {
-        combL[c] = min((int)(REV_COMB_BASE_L[c] * srScale), 7199);
-        combR[c] = min((int)(REV_COMB_BASE_R[c] * srScale), 7199);
-    }
-    for (int a = 0; a < 2; a++) {
-        apL[a] = min((int)(REV_AP_BASE_L[a] * srScale), 1599);
-        apR[a] = min((int)(REV_AP_BASE_R[a] * srScale), 1599);
-    }
-
-    float wet    = g_revMix   / 100.0f;
-    float fb     = 0.50f + (g_revRoom  / 100.0f) * 0.46f;
-    float wscale = g_revWidth / 200.0f;
-    float dry    = 1.0f - wet;
-    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
-        float inL = buf[i], inR = (nch >= 2) ? buf[i + 1] : buf[i];
-        float outL = 0, outR = 0;
-        for (int c = 0; c < 4; c++) {
-            float dL = g_revCombBufL[c][g_revCombPosL[c]];
-            float dR = g_revCombBufR[c][g_revCombPosR[c]];
-            g_revCombBufL[c][g_revCombPosL[c]] = inL + dL * fb;
-            g_revCombBufR[c][g_revCombPosR[c]] = inR + dR * fb;
-            if (++g_revCombPosL[c] >= combL[c]) g_revCombPosL[c] = 0;
-            if (++g_revCombPosR[c] >= combR[c]) g_revCombPosR[c] = 0;
-            outL += dL; outR += dR;
-        }
-        outL *= 0.25f; outR *= 0.25f;
-        for (int a = 0; a < 2; a++) {
-            float dL = g_revApBufL[a][g_revApPosL[a]];
-            float dR = g_revApBufR[a][g_revApPosR[a]];
-            g_revApBufL[a][g_revApPosL[a]] = outL + dL * 0.5f;
-            g_revApBufR[a][g_revApPosR[a]] = outR + dR * 0.5f;
-            if (++g_revApPosL[a] >= apL[a]) g_revApPosL[a] = 0;
-            if (++g_revApPosR[a] >= apR[a]) g_revApPosR[a] = 0;
-            outL = dL - outL * 0.5f;
-            outR = dR - outR * 0.5f;
-        }
-        float wL = outL * (0.5f + wscale) + outR * (0.5f - wscale);
-        float wR = outR * (0.5f + wscale) + outL * (0.5f - wscale);
-        buf[i] = dry * inL + wet * wL;
-        if (nch >= 2) buf[i + 1] = dry * inR + wet * wR;
-        // Extra channels pass through unchanged
-    }
-}
-
-// --- Saturation (soft-clip waveshaper, tube warmth) ---
-// Crossover LP state for saturation (200 Hz split)
-static float g_satLpL = 0, g_satLpR = 0;
-
-void CALLBACK DSP_Saturate(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    float* buf  = (float*)buffer;
-    DWORD  n    = length / sizeof(float);
-    float drive = g_satDrive;
-    float wet   = (g_satLevel / 100.0f) * 0.35f;
-    float dry   = 1.0f - wet;
-    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
-    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
-    int nch = ci.chans > 0 ? ci.chans : 2;
-    const float lpA = expf(-6.28318f * 200.0f / sr);
-    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
-        float inL = buf[i], inR = (nch >= 2) ? buf[i + 1] : buf[i];
-        g_satLpL = lpA * g_satLpL + (1.0f - lpA) * inL;
-        float loL = g_satLpL;
-        float hiL = inL - loL;
-        float satHiL = hiL * drive; satHiL = satHiL / (1.0f + fabsf(satHiL));
-        float satLoL = loL * drive; satLoL = satLoL / (1.0f + fabsf(satLoL));
-        buf[i] = (hiL * dry + satHiL * wet) + (loL * 0.95f + satLoL * 0.05f);
-        if (nch >= 2) {
-            g_satLpR = lpA * g_satLpR + (1.0f - lpA) * inR;
-            float loR = g_satLpR, hiR = inR - loR;
-            float satHiR = hiR * drive; satHiR = satHiR / (1.0f + fabsf(satHiR));
-            float satLoR = loR * drive; satLoR = satLoR / (1.0f + fabsf(satLoR));
-            buf[i + 1] = (hiR * dry + satHiR * wet) + (loR * 0.95f + satLoR * 0.05f);
-        }
-        // Extra channels pass through unchanged
-    }
-}
-
-// --- Vinyl Emulation (high-freq roll-off + smooth crackle pops + surface hiss + M-S stereo) ---
-static float g_vinLpL        = 0, g_vinLpR       = 0;
-static float g_vinHissL      = 0, g_vinHissR      = 0;
-static DWORD g_vinCrackTimer = 0;
-static float g_vinCrackEnvL  = 0, g_vinCrackEnvR  = 0;
-static float g_vinCrackDecay = 0.993f;
-// Subtle chorus on side channel (M-S stereo field)
-static float g_vinChorusBuf[1024] = {};
-static int   g_vinChorusPos  = 0;
-static float g_vinChorusLFO  = 0.0f;  // phase 0..1
-// Subtle pitch wobble on mid (mono)
-static float g_vinMidBuf[512] = {};
-static int   g_vinMidPos  = 0;
-static float g_vinMidLFO  = 0.5f;  // offset from side LFO to avoid sync
-
-void CALLBACK DSP_Vinyl(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    float* buf = (float*)buffer;
-    DWORD  n   = length / sizeof(float);
-
-    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
-    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
-
-    float freq       = max(500.0f, min(20000.0f, g_vinLpFreq));
-    float alpha      = expf(-6.28318f * freq / sr);
-    float crackScale = g_vinCrackle / 100.0f;
-    // Surface hiss amplitude: subtle baseline + crackle-scaled component
-    float hissAmp    = 0.0003f + crackScale * 0.0018f;
-    // Hiss LP alpha: ~5 kHz rolloff for warm surface noise character
-    const float hA   = expf(-6.28318f * 5000.0f / sr);
-
-    int nch = ci.chans > 0 ? ci.chans : 2;
-    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
-        // HF roll-off on signal
-        g_vinLpL = alpha * g_vinLpL + (1.0f - alpha) * buf[i];
-        buf[i] = g_vinLpL;
-        if (nch >= 2) {
-            g_vinLpR = alpha * g_vinLpR + (1.0f - alpha) * buf[i + 1];
-            buf[i + 1] = g_vinLpR;
-        }
-
-        // ── M-S stereo field (stereo only; mono skips side processing) ───
-        float mid, side;
-        if (nch >= 2) {
-            mid  = (buf[i] + buf[i + 1]) * 0.5f;
-            side = (buf[i] - buf[i + 1]) * 0.5f;
-        } else {
-            mid = buf[i];
-            side = 0;
-        }
-
-        // Gentle saturation on mid (warm mono core, like a slightly overdriven tube)
-        mid = mid / (1.0f + fabsf(mid) * 0.5f) * 1.08f;
-
-        // Barely noticeable pitch wobble on mid — slow warble like an old turntable
-        g_vinMidBuf[g_vinMidPos] = mid;
-        float midLfo = sinf(g_vinMidLFO * 6.28318f);
-        g_vinMidLFO += 0.6f / sr;    // 0.6 Hz — slow wow, more noticeable
-        if (g_vinMidLFO >= 1.0f) g_vinMidLFO -= 1.0f;
-        float midDelay = 20.0f + midLfo * 18.0f;  // wider sweep, more pitch movement
-        int   md0  = (int)midDelay;
-        float mfrac = midDelay - (float)md0;
-        float m0 = g_vinMidBuf[(g_vinMidPos - md0 + 512) & 511];
-        float m1 = g_vinMidBuf[(g_vinMidPos - md0 - 1 + 512) & 511];
-        mid = m0 + mfrac * (m1 - m0);
-        g_vinMidPos = (g_vinMidPos + 1) & 511;
-
-        // Subtle chorus on side channel only (~2% depth, barely noticeable)
-        g_vinChorusBuf[g_vinChorusPos] = side;
-        float lfo = sinf(g_vinChorusLFO * 6.28318f);
-        g_vinChorusLFO += 0.35f / sr;   // 0.35 Hz LFO rate
-        if (g_vinChorusLFO >= 1.0f) g_vinChorusLFO -= 1.0f;
-        float delaySmp = 485.0f + lfo * 88.0f;  // ~11ms base ± 2ms depth
-        int   d0   = (int)delaySmp;
-        float frac = delaySmp - (float)d0;
-        float s0   = g_vinChorusBuf[(g_vinChorusPos - d0 + 1024) & 1023];
-        float s1   = g_vinChorusBuf[(g_vinChorusPos - d0 - 1 + 1024) & 1023];
-        float chorSide = s0 + frac * (s1 - s0);
-        g_vinChorusPos = (g_vinChorusPos + 1) & 1023;
-        side = side * 0.90f + chorSide * 0.10f;  // 10% wet
-
-        // Reconstruct L/R (or write mono)
-        buf[i] = mid + side;
-        if (nch >= 2) buf[i + 1] = mid - side;
-
-        if (crackScale > 0.0f) {
-            // Surface hiss: independent L/R noise through warm LP
-            float nL = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
-            g_vinHissL = hA * g_vinHissL + (1.0f - hA) * nL;
-            buf[i] += g_vinHissL * hissAmp;
-            if (nch >= 2) {
-                float nR = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
-                g_vinHissR = hA * g_vinHissR + (1.0f - hA) * nR;
-                buf[i + 1] += g_vinHissR * hissAmp;
-            }
-
-            // Crackle/pop envelope decay
-            g_vinCrackEnvL *= g_vinCrackDecay;
-            g_vinCrackEnvR *= g_vinCrackDecay;
-
-            // Apply crackle with warm soft-clip (removes harsh transient edge)
-            float cL = g_vinCrackEnvL, cR = g_vinCrackEnvR;
-            buf[i] += cL / (1.0f + fabsf(cL) * 6.0f);
-            if (nch >= 2) buf[i + 1] += cR / (1.0f + fabsf(cR) * 6.0f);
-
-            // Schedule next crackle event
-            if (g_vinCrackTimer == 0) {
-                // Interval: sparse at low crackle, denser at high — with wide randomness
-                DWORD baseInt = (DWORD)(sr * 1.8f / max(0.01f, crackScale));
-                g_vinCrackTimer = baseInt / 3 + (DWORD)(rand() % (baseInt * 2 + 1));
-
-                // Amplitude varies per pop
-                float amp = crackScale * (0.03f + (rand() % 90) * 0.001f);
-
-                // Decay time: 20-100ms so crackles fade naturally, not click
-                int decaySmp = (int)(sr * 0.02f) + rand() % (int)(sr * 0.08f + 1);  // 20ms to 100ms
-                g_vinCrackDecay = expf(-1.0f / (float)decaySmp);
-
-                // Side pop: one channel dominant, other gets warm bleed
-                float dominant = 0.55f + (rand() % 45) * 0.01f;   // 0.55-1.0
-                float bleed    = (rand() % 35) * 0.01f;            // 0.0-0.34
-                if (rand() & 1) {
-                    g_vinCrackEnvL += amp * dominant;
-                    g_vinCrackEnvR += amp * bleed;
-                } else {
-                    g_vinCrackEnvL += amp * bleed;
-                    g_vinCrackEnvR += amp * dominant;
-                }
-            }
-            if (g_vinCrackTimer > 0) g_vinCrackTimer--;
-        }
-    }
-}
-
-// --- HiFi Amplifier (warm bass shelf + soft saturation) ---
-static float g_hfiBssL = 0, g_hfiBssR = 0;
-
-void CALLBACK DSP_Hifi(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    float* buf = (float*)buffer;
-    DWORD  n   = length / sizeof(float);
-    BASS_CHANNELINFO ci = {}; BASS_ChannelGetInfo(channel, &ci);
-    float sr = ci.freq > 0 ? (float)ci.freq : 44100.0f;
-    float alpha = expf(-6.28318f * 80.0f / sr);   // 1-pole LP ~80 Hz shelf
-    int nch = ci.chans > 0 ? ci.chans : 2;
-    float bassAdd = (powf(10.0f, g_hfiBassDb / 20.0f) - 1.0f);
-    float warmth  = (g_hfiWarmth / 100.0f) * 0.8f;
-    for (DWORD i = 0; i + (DWORD)nch <= n; i += nch) {
-        float inL = buf[i];
-        g_hfiBssL = alpha * g_hfiBssL + (1.0f - alpha) * inL;
-        float outL = inL + g_hfiBssL * bassAdd;
-        buf[i] = warmth > 0.0f ? outL / (1.0f + fabsf(outL) * warmth) : outL;
-        if (nch >= 2) {
-            float inR = buf[i + 1];
-            g_hfiBssR = alpha * g_hfiBssR + (1.0f - alpha) * inR;
-            float outR = inR + g_hfiBssR * bassAdd;
-            buf[i + 1] = warmth > 0.0f ? outR / (1.0f + fabsf(outR) * warmth) : outR;
-        }
-        // Extra channels pass through unchanged
-    }
-}
-
 // --- Recording: real-time FLAC encoding via libFLAC stream encoder ---
 static FLAC__StreamEncoder* g_recEncoder = NULL;
 // Pre-allocated conversion buffer — avoids heap allocation on every DSP callback
@@ -1388,6 +986,28 @@ static int FindSoundHotkey(const wchar_t* path)
     return -1;
 }
 
+// --- Function hotkeys: play controls bound to keys, stored in the same
+//     [Hotkeys] section under reserved "@name" keys (paths can never collide) ---
+#define FNHK_COUNT          5
+#define ID_HOTKEY_FN_BASE   960
+static SoundHotkey g_fnHotkeys[FNHK_COUNT] = {};
+static const wchar_t* FNHK_KEY(int i)
+{
+    static const wchar_t* K[FNHK_COUNT] = { L"@play", L"@pause", L"@stop", L"@prev", L"@next" };
+    return K[i];
+}
+static const wchar_t* FNHK_NAME(int i)
+{
+    static const wchar_t* N[FNHK_COUNT] = { L"播放 / 暂停", L"暂停", L"停止", L"上一曲", L"下一曲" };
+    return N[i];
+}
+static int FNHK_BY_KEY(const wchar_t* key)
+{
+    for (int i = 0; i < FNHK_COUNT; i++)
+        if (_wcsicmp(key, FNHK_KEY(i)) == 0) return i;
+    return -1;
+}
+
 // Read [Hotkeys] section: "escaped path" = G|vk|mods  (G = global, L = local)
 static void LoadSoundHotkeys()
 {
@@ -1415,17 +1035,20 @@ static void LoadSoundHotkeys()
         HkDecodeKey(line, hk.path, MAX_PATH);
         if (!hk.path[0]) continue;
         hk.global = global; hk.vk = vk; hk.mods = mods;
+        // Function hotkeys (@play/@pause/...) live in their own slots
+        int fi = FNHK_BY_KEY(hk.path);
+        if (fi >= 0) { g_fnHotkeys[fi] = hk; g_fnHotkeys[fi].path[0] = 0; continue; }
         if ((int)g_soundHotkeys.size() < SNDHK_MAX)
             g_soundHotkeys.push_back(hk);
     }
 }
 
 // Write (or remove when hk == NULL) one binding under [Hotkeys]
-static void WriteSoundHotkeyIni(const wchar_t* path, const SoundHotkey* hk)
+static void WriteSoundHotkeyIni(const wchar_t* iniKey, const SoundHotkey* hk)
 {
     GetIniPath();
     wchar_t key[MAX_PATH * 3 + 2] = L"";
-    HkEncodeKey(path, key, MAX_PATH * 3 + 2);
+    HkEncodeKey(iniKey, key, MAX_PATH * 3 + 2);
     if (hk) {
         wchar_t val[32];
         swprintf_s(val, L"%c|%u|%u", hk->global ? L'G' : L'L', hk->vk, hk->mods);
@@ -1435,16 +1058,64 @@ static void WriteSoundHotkeyIni(const wchar_t* path, const SoundHotkey* hk)
     }
 }
 
-// Rebuild all system-wide registrations (also clears stale slots)
-static void RegisterAllSoundHotkeys(HWND hwnd)
+// Global triggering no longer uses RegisterHotKey (an IME can eat those keys
+// before they reach us). A low-level keyboard hook sees keys BEFORE the IME,
+// so global sound/fn hotkeys fire even with Chinese input active.
+// The 4 media keys stay on RegisterHotKey — they never conflict.
+static HHOOK g_llKbHook      = NULL;
+static bool  g_llWasDown[256] = {};   // per-vk down state — mimics MOD_NOREPEAT
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
 {
-    if (!hwnd || !IsWindow(hwnd)) return;
-    for (int i = 0; i < SNDHK_MAX; i++) UnregisterHotKey(hwnd, ID_HOTKEY_SND_BASE + i);
-    for (int i = 0; i < (int)g_soundHotkeys.size(); i++) {
-        if (!g_soundHotkeys[i].global) continue;
-        RegisterHotKey(hwnd, ID_HOTKEY_SND_BASE + i,
-            g_soundHotkeys[i].mods | MOD_NOREPEAT, g_soundHotkeys[i].vk);
+    if (code >= 0 && g_hwnd && IsWindow(g_hwnd)) {
+        KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lParam;
+        UINT vk = (UINT)k->vkCode;
+        if (vk < 256) {
+            if (k->flags & LLKHF_UP) {
+                g_llWasDown[vk] = false;
+            } else if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+                bool isMediaKey = (vk == VK_MEDIA_PLAY_PAUSE || vk == VK_MEDIA_NEXT_TRACK ||
+                                   vk == VK_MEDIA_PREV_TRACK || vk == VK_MEDIA_STOP);
+                if (!isMediaKey) {
+                    UINT mods = 0;
+                    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
+                    if (GetAsyncKeyState(VK_MENU)    & 0x8000) mods |= MOD_ALT;
+                    if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) mods |= MOD_SHIFT;
+                    if (((USHORT)GetAsyncKeyState(VK_LWIN) | (USHORT)GetAsyncKeyState(VK_RWIN)) & 0x8000) mods |= MOD_WIN;
+                    int hit = -1;
+                    for (int i = 0; i < (int)g_soundHotkeys.size() && hit < 0; i++) {
+                        const SoundHotkey& hk = g_soundHotkeys[i];
+                        if (hk.global && hk.vk == vk && hk.mods == mods) hit = i;
+                    }
+                    for (int i = 0; i < FNHK_COUNT && hit < 0; i++) {
+                        const SoundHotkey& hk = g_fnHotkeys[i];
+                        if (hk.global && hk.vk == vk && hk.mods == mods) hit = 1000 + i;
+                    }
+                    if (hit >= 0) {
+                        bool repeat = g_llWasDown[vk];
+                        g_llWasDown[vk] = true;
+                        if (!repeat) {
+                            if (hit < 1000) PostMessage(g_hwnd, WM_HOTKEY, ID_HOTKEY_SND_BASE + hit, 0);
+                            else            PostMessage(g_hwnd, WM_HOTKEY, ID_HOTKEY_FN_BASE + (hit - 1000), 0);
+                        }
+                        return 1;   // bound key: swallow system-wide (trigger or held repeat)
+                    }
+                    g_llWasDown[vk] = false;
+                }
+            }
+        }
     }
+    return CallNextHookEx(g_llKbHook, code, wParam, lParam);
+}
+
+static void InstallKeyboardHook()
+{
+    if (!g_llKbHook)
+        g_llKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandleW(NULL), 0);
+}
+static void ShutdownKeyboardHook()
+{
+    if (g_llKbHook) { UnhookWindowsHookEx(g_llKbHook); g_llKbHook = NULL; }
 }
 
 // Play a bound sound; if it left the playlist, add it back first (Soundpad behavior)
@@ -1486,6 +1157,38 @@ static int MatchLocalSoundHotkey(UINT vk, UINT mods)
     }
     return -1;
 }
+static int MatchLocalFnHotkey(UINT vk, UINT mods)
+{
+    for (int i = 0; i < FNHK_COUNT; i++) {
+        const SoundHotkey& hk = g_fnHotkeys[i];
+        if (!hk.global && hk.vk == vk && hk.mods == mods) return i;
+    }
+    return -1;
+}
+
+static void MicOutPauseTap(bool pause);   // defined in the mic-output module below
+
+// Pause without toggling (for the dedicated "pause" hotkey)
+static void PauseOnly()
+{
+    if (currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING) {
+        BASS_ChannelPause(currentStream);
+        MicOutPauseTap(true);
+        KillTimer(g_hwnd, IDT_PLAYBACK);
+        UpdatePlayBtn(); UpdateStatusBar(); UpdateThumbButtons(); SmtcUpdatePlaybackStatus();
+    }
+}
+
+static void TriggerFnHotkey(int i)
+{
+    switch (i) {
+    case 0: TogglePlayPause(); break;
+    case 1: PauseOnly(); break;
+    case 2: StopAudio(); break;
+    case 3: PlayPrev(); break;
+    case 4: PlayNext(); break;
+    }
+}
 static bool IsTypingFocus()
 {
     HWND fw = GetFocus();
@@ -1497,13 +1200,20 @@ static bool IsTypingFocus()
 
 // --- Bind dialog (modal with its own pump, owner disabled while open) ---
 static wchar_t s_hkBindPath[MAX_PATH] = L"";
+static int    s_hkBindFn = -1;   // >=0: binding a play-control button instead of a file
 
 static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_CREATE: {
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
-        int hkIdx = FindSoundHotkey(s_hkBindPath);
+        bool haveBinding = false; SoundHotkey cur = {};
+        if (s_hkBindFn >= 0) {
+            if (g_fnHotkeys[s_hkBindFn].vk) { cur = g_fnHotkeys[s_hkBindFn]; haveBinding = true; }
+        } else {
+            int hkIdx = FindSoundHotkey(s_hkBindPath);
+            if (hkIdx >= 0) { cur = g_soundHotkeys[hkIdx]; haveBinding = true; }
+        }
         HWND hG = CreateWindowW(L"BUTTON", L"全局热键（在任何程序中生效）",
             WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_TABSTOP | WS_GROUP,
             14, 14, 310, 20, hwnd, (HMENU)IDHK_GLOBAL, hInst, NULL);
@@ -1531,14 +1241,22 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         SendMessage(hOk, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
         SendMessage(hCa, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
         CheckRadioButton(hwnd, IDHK_GLOBAL, IDHK_LOCAL,
-            (hkIdx >= 0 && g_soundHotkeys[hkIdx].global) ? IDHK_GLOBAL : IDHK_LOCAL);
-        if (hkIdx >= 0) {
-            const SoundHotkey& hk = g_soundHotkeys[hkIdx];
+            (haveBinding && !cur.global) ? IDHK_LOCAL : IDHK_GLOBAL);   // default: GLOBAL
+        if (haveBinding) {
             BYTE hf = 0;
-            if (hk.mods & MOD_SHIFT)   hf |= HOTKEYF_SHIFT;
-            if (hk.mods & MOD_CONTROL) hf |= HOTKEYF_CONTROL;
-            if (hk.mods & MOD_ALT)     hf |= HOTKEYF_ALT;
-            SendMessage(hKey, HKM_SETHOTKEY, MAKEWPARAM((WORD)hk.vk, hf), 0);
+            if (cur.mods & MOD_SHIFT)   hf |= HOTKEYF_SHIFT;
+            if (cur.mods & MOD_CONTROL) hf |= HOTKEYF_CONTROL;
+            if (cur.mods & MOD_ALT)     hf |= HOTKEYF_ALT;
+            SendMessage(hKey, HKM_SETHOTKEY, MAKEWPARAM((WORD)cur.vk, hf), 0);
+        }
+
+        // Detach the IME from the dialog and all children so the hotkey
+        // control records raw keys even while a Chinese IME is active
+        ImmAssociateContext(hwnd, NULL);
+        for (HWND hc = GetWindow(hwnd, GW_CHILD); hc; hc = GetWindow(hc, GW_HWNDNEXT)) {
+            ImmAssociateContext(hc, NULL);
+            for (HWND hg = GetWindow(hc, GW_CHILD); hg; hg = GetWindow(hg, GW_HWNDNEXT))
+                ImmAssociateContext(hg, NULL);
         }
         return 0;
     }
@@ -1546,11 +1264,15 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         int cmd = LOWORD(wParam);
         if (cmd == IDHK_CANCEL) { DestroyWindow(hwnd); return 0; }
         if (cmd == IDHK_CLEAR) {
-            int i = FindSoundHotkey(s_hkBindPath);
-            if (i >= 0) {
-                g_soundHotkeys.erase(g_soundHotkeys.begin() + i);
-                WriteSoundHotkeyIni(s_hkBindPath, NULL);
-                RegisterAllSoundHotkeys(g_hwnd);
+            if (s_hkBindFn >= 0) {
+                g_fnHotkeys[s_hkBindFn] = SoundHotkey{};
+                WriteSoundHotkeyIni(FNHK_KEY(s_hkBindFn), NULL);
+            } else {
+                int i = FindSoundHotkey(s_hkBindPath);
+                if (i >= 0) {
+                    g_soundHotkeys.erase(g_soundHotkeys.begin() + i);
+                    WriteSoundHotkeyIni(s_hkBindPath, NULL);
+                }
             }
             DestroyWindow(hwnd);
             return 0;
@@ -1576,8 +1298,13 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             if (global) {
                 // Trial registration: is the combo free? (skip when it is already ours for this file)
                 bool ours = false;
-                for (auto& e : g_soundHotkeys)
-                    if (e.global && e.vk == vk && e.mods == mods && _wcsicmp(e.path, s_hkBindPath) == 0) { ours = true; break; }
+                if (s_hkBindFn >= 0) {
+                    const SoundHotkey& e = g_fnHotkeys[s_hkBindFn];
+                    ours = (e.global && e.vk == vk && e.mods == mods);
+                } else {
+                    for (auto& e : g_soundHotkeys)
+                        if (e.global && e.vk == vk && e.mods == mods && _wcsicmp(e.path, s_hkBindPath) == 0) { ours = true; break; }
+                }
                 if (!ours && !RegisterHotKey(hwnd, 0x7FFF, mods | MOD_NOREPEAT, vk)) {
                     MessageBoxW(hwnd, L"该热键已被本程序的其他音效或其他程序占用，请换一个组合。", L"绑定热键", MB_OK | MB_ICONWARNING);
                     return 0;
@@ -1585,13 +1312,17 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 if (!ours) UnregisterHotKey(hwnd, 0x7FFF);
             }
             SoundHotkey nhk = {};
-            wcsncpy_s(nhk.path, s_hkBindPath, _TRUNCATE);
             nhk.global = global; nhk.vk = vk; nhk.mods = mods;
-            int i = FindSoundHotkey(s_hkBindPath);
-            if (i >= 0) g_soundHotkeys[i] = nhk;
-            else if ((int)g_soundHotkeys.size() < SNDHK_MAX) g_soundHotkeys.push_back(nhk);
-            WriteSoundHotkeyIni(s_hkBindPath, &nhk);
-            RegisterAllSoundHotkeys(g_hwnd);
+            if (s_hkBindFn >= 0) {
+                g_fnHotkeys[s_hkBindFn] = nhk;
+                WriteSoundHotkeyIni(FNHK_KEY(s_hkBindFn), &nhk);
+            } else {
+                wcsncpy_s(nhk.path, s_hkBindPath, _TRUNCATE);
+                int i = FindSoundHotkey(s_hkBindPath);
+                if (i >= 0) g_soundHotkeys[i] = nhk;
+                else if ((int)g_soundHotkeys.size() < SNDHK_MAX) g_soundHotkeys.push_back(nhk);
+                WriteSoundHotkeyIni(s_hkBindPath, &nhk);
+            }
             DestroyWindow(hwnd);
             return 0;
         }
@@ -1608,9 +1339,10 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-static void OpenHotkeyBindDialog(const wchar_t* path)
+static void OpenHotkeyBindDialog(const wchar_t* path, int fnIdx)
 {
-    if (!path || !path[0] || !g_hwnd || !IsWindow(g_hwnd)) return;
+    if ((!path || !path[0]) && fnIdx < 0) return;
+    if (!g_hwnd || !IsWindow(g_hwnd)) return;
     if (g_hwndHotkeyDlg && IsWindow(g_hwndHotkeyDlg)) { SetForegroundWindow(g_hwndHotkeyDlg); return; }
     static bool reg = false;
     if (!reg) {
@@ -1623,9 +1355,11 @@ static void OpenHotkeyBindDialog(const wchar_t* path)
         RegisterClassW(&wc);
         reg = true;
     }
-    wcsncpy_s(s_hkBindPath, path, _TRUNCATE);
+    s_hkBindFn = fnIdx;
+    if (path) wcsncpy_s(s_hkBindPath, path, _TRUNCATE); else s_hkBindPath[0] = L'\0';
     wchar_t cap[160];
-    swprintf_s(cap, L"绑定热键 - %s", Filename(path));
+    if (fnIdx >= 0) swprintf_s(cap, L"绑定热键 - %s", FNHK_NAME(fnIdx));
+    else            swprintf_s(cap, L"绑定热键 - %s", Filename(path));
     RECT rc; GetWindowRect(g_hwnd, &rc);
     int ww = 340, wh = 200;
     int x = rc.left + max(0, ((rc.right - rc.left) - ww) / 2);
@@ -2274,26 +2008,6 @@ void SaveSettings()
 {
     GetIniPath();
     wchar_t buf[64];
-    swprintf_s(buf, L"%d", (int)g_bassBoost);  WritePrivateProfileString(L"DSP", L"BassBoost", buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_bbFreqLow);        WritePrivateProfileString(L"DSP", L"BBFreqLow", buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_bbFreqHigh);       WritePrivateProfileString(L"DSP", L"BBFreqHigh", buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_bbGainDB);         WritePrivateProfileString(L"DSP", L"BBGainDB", buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_mono);        WritePrivateProfileString(L"DSP", L"Mono",     buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_normalize);   WritePrivateProfileString(L"DSP", L"Normalize",buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_dspReverb);   WritePrivateProfileString(L"DSP", L"Reverb",   buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_dspSaturate); WritePrivateProfileString(L"DSP", L"Saturate", buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_dspVinyl);    WritePrivateProfileString(L"DSP", L"Vinyl",    buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_dspHifi);     WritePrivateProfileString(L"DSP", L"Hifi",     buf, g_iniPath);
-    swprintf_s(buf, L"%d", (int)g_dspBypass); WritePrivateProfileString(L"DSP", L"Bypass",   buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_revMix);     WritePrivateProfileString(L"DSP", L"RevMix",    buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_revRoom);    WritePrivateProfileString(L"DSP", L"RevRoom",   buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_revWidth);   WritePrivateProfileString(L"DSP", L"RevWidth",  buf, g_iniPath);
-    swprintf_s(buf, L"%.2f", g_satDrive);   WritePrivateProfileString(L"DSP", L"SatDrive",  buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_satLevel);   WritePrivateProfileString(L"DSP", L"SatLevel",  buf, g_iniPath);
-    swprintf_s(buf, L"%.0f", g_vinLpFreq);  WritePrivateProfileString(L"DSP", L"VinFreq",   buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_vinCrackle); WritePrivateProfileString(L"DSP", L"VinCrackle",buf, g_iniPath);
-    swprintf_s(buf, L"%.2f", g_hfiBassDb);  WritePrivateProfileString(L"DSP", L"HfiBass",   buf, g_iniPath);
-    swprintf_s(buf, L"%.1f", g_hfiWarmth);  WritePrivateProfileString(L"DSP", L"HfiWarmth", buf, g_iniPath);
     // Recording output dir
     WritePrivateProfileString(L"Paths", L"RecordOutDir", g_recOutDir, g_iniPath);
     WritePrivateProfileString(L"Paths", L"RecordSaveDir", g_recSaveDir, g_iniPath);
@@ -2355,26 +2069,6 @@ void LoadSettings()
     wchar_t buf[64];
 #define GETI(sec,key,def) (int)GetPrivateProfileInt(sec, key, def, g_iniPath)
 #define GETF(sec,key,def) ([&]{ GetPrivateProfileString(sec,key,L#def,buf,64,g_iniPath); return (float)_wtof(buf); }())
-    g_bassBoost = GETI(L"DSP", L"BassBoost", 0) != 0;
-    g_bbFreqLow = GETF(L"DSP", L"BBFreqLow", 30.0);
-    g_bbFreqHigh = GETF(L"DSP", L"BBFreqHigh", 100.0);
-    g_bbGainDB = GETF(L"DSP", L"BBGainDB", 5.0);
-    g_mono        = GETI(L"DSP", L"Mono",     0) != 0;
-    g_normalize   = GETI(L"DSP", L"Normalize",0) != 0;
-    g_dspReverb   = GETI(L"DSP", L"Reverb",   0) != 0;
-    g_dspSaturate = GETI(L"DSP", L"Saturate", 0) != 0;
-    g_dspVinyl    = GETI(L"DSP", L"Vinyl",    0) != 0;
-    g_dspHifi     = GETI(L"DSP", L"Hifi",     0) != 0;
-    g_dspBypass   = GETI(L"DSP", L"Bypass",   0) != 0;
-    g_revMix     = GETF(L"DSP", L"RevMix",    8.0);
-    g_revRoom    = GETF(L"DSP", L"RevRoom",   75.0);
-    g_revWidth   = GETF(L"DSP", L"RevWidth",  80.0);
-    g_satDrive   = GETF(L"DSP", L"SatDrive",  1.6);
-    g_satLevel   = GETF(L"DSP", L"SatLevel",  72.0);
-    g_vinLpFreq  = GETF(L"DSP", L"VinFreq",   17500.0);
-    g_vinCrackle = GETF(L"DSP", L"VinCrackle",15.0);
-    g_hfiBassDb  = GETF(L"DSP", L"HfiBass",   3.0);
-    g_hfiWarmth  = GETF(L"DSP", L"HfiWarmth", 33.0);
     GetPrivateProfileString(L"Paths", L"RecordOutDir", L"", g_recOutDir, MAX_PATH, g_iniPath);
     GetPrivateProfileString(L"Paths", L"RecordSaveDir", L"", g_recSaveDir, MAX_PATH, g_iniPath);
     GetPrivateProfileString(L"Discogs", L"Token", L"", g_discogsToken, _countof(g_discogsToken), g_iniPath);
@@ -2450,7 +2144,7 @@ void LoadSettings()
         currentVolume = max(0.0f, min(1.0f, vol));
     }
     g_rememberSession = GETI(L"UI", L"RememberSession", 1);
-    if (g_rememberSession < 0 || g_rememberSession > 2) g_rememberSession = 0;
+    if (g_rememberSession != 0) g_rememberSession = 1;   // legacy "remember seek position" folds into track mode
     g_micOutEnabled = GETI(L"MicOut", L"Enabled", 0) != 0;
     g_micOutMode = GETI(L"MicOut", L"Mode", 1);
     if (g_micOutMode < 0 || g_micOutMode > 1) g_micOutMode = 1;
@@ -2580,33 +2274,6 @@ static bool RestoreSession()
 // ============================================================
 //  M3U Playlist save / load
 // ============================================================
-static void SavePlaylistM3U(HWND hwndParent)
-{
-    if (g_playlist.empty()) {
-        MessageBox(hwndParent, L"播放列表为空。", L"保存播放列表", MB_ICONWARNING);
-        return;
-    }
-    OPENFILENAME ofn = {}; ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwndParent;
-    wchar_t path[MAX_PATH] = L"playlist.m3u";
-    ofn.lpstrFilter  = L"M3U 播放列表\0*.m3u\0所有文件\0*.*\0";
-    ofn.lpstrFile    = path;
-    ofn.nMaxFile     = MAX_PATH;
-    ofn.lpstrDefExt  = L"m3u";
-    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    if (!GetSaveFileName(&ofn)) return;
-
-    FILE* f = nullptr; _wfopen_s(&f, path, L"w,ccs=UTF-8");
-    if (!f) { MessageBox(hwndParent, L"无法打开文件进行写入。", L"保存播放列表", MB_ICONERROR); return; }
-    fwprintf(f, L"#EXTM3U\r\n");
-    for (auto& t : g_playlist)
-        fwprintf(f, L"#EXTINF:-1,%s\r\n%s\r\n", t.display, t.path);
-    fclose(f);
-    wchar_t msg[MAX_PATH + 64];
-    swprintf_s(msg, L"已将 %d 首曲目保存到播放列表。", (int)g_playlist.size());
-    MessageBox(hwndParent, msg, L"保存播放列表", MB_ICONINFORMATION);
-}
-
 static bool IsM3U(const wchar_t* p)
 {
     const wchar_t* e = wcsrchr(p, L'.');
@@ -2657,84 +2324,6 @@ static void LoadM3UFromPath(const wchar_t* path, bool append = false)
         g_currentIndex = 0; SendMessage(hListBox, LB_SETCURSEL, 0, 0);
     }
     UpdateStatusBar();
-}
-
-static void LoadPlaylistM3U(HWND hwndParent)
-{
-    OPENFILENAME ofn = {}; ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwndParent;
-    wchar_t path[MAX_PATH] = L"";
-    ofn.lpstrFilter = L"M3U 播放列表\0*.m3u;*.m3u8\0所有文件\0*.*\0";
-    ofn.lpstrFile   = path;
-    ofn.nMaxFile    = MAX_PATH;
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (!GetOpenFileName(&ofn)) return;
-    LoadM3UFromPath(path, false);
-}
-
-// Scan peak for normalization on any file path (returns peak level)
-// Caches the last result to avoid rescanning the same file repeatedly
-static wchar_t s_peakCachePath[MAX_PATH] = {};
-static float   s_peakCacheVal = 0.001f;
-
-static float ScanPeak(const wchar_t* path)
-{
-    if (s_peakCachePath[0] && _wcsicmp(path, s_peakCachePath) == 0)
-        return s_peakCacheVal;
-
-    float peak = 0.001f;
-    HSTREAM scan = BASS_StreamCreateFile(FALSE, path, 0, 0,
-        BASS_UNICODE | BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
-    if (scan) {
-        float fbuf[4096]; DWORD got; int chunks = 0;
-        while (chunks < 200 &&
-            (got = BASS_ChannelGetData(scan, fbuf, sizeof(fbuf))) != (DWORD)-1 && got > 0) {
-            DWORD n = got / sizeof(float);
-            for (DWORD j = 0; j < n; j++) {
-                float a = fabsf(fbuf[j]);
-                if (a > peak) peak = a;
-            }
-            chunks++;
-        }
-        BASS_StreamFree(scan);
-    }
-    wcsncpy_s(s_peakCachePath, path, _TRUNCATE);
-    s_peakCacheVal = peak;
-    return peak;
-}
-
-void ApplyDSP()
-{
-    if (!currentStream) return;
-    // Remove all DSP
-    if (g_dspMono)   { BASS_ChannelRemoveDSP(currentStream, g_dspMono);   g_dspMono   = 0; }
-    if (g_dspBass)   { BASS_ChannelRemoveDSP(currentStream, g_dspBass);   g_dspBass   = 0; }
-    if (g_dspRevHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspRevHdl); g_dspRevHdl = 0; }
-    if (g_dspSatHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspSatHdl); g_dspSatHdl = 0; }
-    if (g_dspVinHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspVinHdl); g_dspVinHdl = 0; }
-    if (g_dspHfiHdl) { BASS_ChannelRemoveDSP(currentStream, g_dspHfiHdl); g_dspHfiHdl = 0; }
-    // Reapply
-    if (g_mono)        g_dspMono   = BASS_ChannelSetDSP(currentStream, DSP_Mono,     NULL, 1);
-    if (g_bassBoost)   g_dspBass   = BASS_ChannelSetDSP(currentStream, DSP_BassBoost,NULL, 2);
-    if (!g_dspBypass) {
-        if (g_dspReverb)   g_dspRevHdl = BASS_ChannelSetDSP(currentStream, DSP_Reverb,  NULL, 3);
-        if (g_dspSaturate) g_dspSatHdl = BASS_ChannelSetDSP(currentStream, DSP_Saturate,NULL, 4);
-        if (g_dspVinyl)    g_dspVinHdl = BASS_ChannelSetDSP(currentStream, DSP_Vinyl,   NULL, 5);
-        if (g_dspHifi)     g_dspHfiHdl = BASS_ChannelSetDSP(currentStream, DSP_Hifi,    NULL, 6);
-    }
-    // Update DSP button visibility
-    if (g_hwnd) LayoutControls(g_hwnd);
-    // Normalization on decode stream, user volume on master output
-    if (g_decStream && g_normalize && g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
-        float peak = ScanPeak(g_playlist[g_currentIndex].path);
-        float normScale = 1.0f / peak;
-        if (normScale > 4.0f) normScale = 4.0f;
-        BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, normScale);
-    } else if (g_decStream) {
-        // Reset decode stream volume when normalize is off
-        BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, 1.0f);
-    }
-    BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
 }
 
 // ============================================================
@@ -3617,7 +3206,6 @@ void PlayIndex(int idx)
         wcsncpy_s(g_radioStationName, dispName, _TRUNCATE);
         g_radioNowPlaying[0] = L'\0';
         BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
-        ApplyDSP();
         MicOutMaybeAttachTap();   // "both" mode: mirror into the cable
         BASS_ChannelPlay(currentStream, FALSE);
         SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
@@ -3682,18 +3270,9 @@ void PlayIndex(int idx)
     g_masterFreq  = ci.freq;
     g_masterChans = ci.chans;
 
-    // Apply normalization to decode stream
-    if (g_normalize && g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
-        float peak = ScanPeak(g_playlist[g_currentIndex].path);
-        float normScale = 1.0f / peak;
-        if (normScale > 4.0f) normScale = 4.0f;
-        BASS_ChannelSetAttribute(g_decStream, BASS_ATTRIB_VOL, normScale);
-    }
-
     // User volume on master output
     BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
     BASS_ChannelSetSync(currentStream, BASS_SYNC_END, 0, EndSyncProc, g_hwnd);
-    ApplyDSP();
     ApplyPitch();
     MicOutMaybeAttachTap();   // "both" mode: mirror the master into the cable
     if (g_hwnd) LayoutControls(g_hwnd);
@@ -3840,14 +3419,6 @@ void PreloadNext()
         dec = BASS_StreamCreateFile(FALSE, g_playlist[next].path, 0, 0,
             BASS_UNICODE | BASS_SAMPLE_FLOAT | BASS_STREAM_DECODE);
     if (!dec) return;
-
-    // Pre-apply normalization to decode stream
-    if (g_normalize) {
-        float peak = ScanPeak(g_playlist[next].path);
-        float normScale = 1.0f / peak;
-        if (normScale > 4.0f) normScale = 4.0f;
-        BASS_ChannelSetAttribute(dec, BASS_ATTRIB_VOL, normScale);
-    }
 
     g_decNext = dec;
     g_decNextIdx = next;
@@ -4293,7 +3864,7 @@ static void VBar(HDC dc, int cx, int cy, int h2, COLORREF c)
     HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br);
 }
 
-enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MONO, BTN_NORMALIZE, BTN_BASSBOOST, BTN_MEDIA, BTN_DSP, BTN_BACK, BTN_RECORD };
+enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MEDIA, BTN_BACK, BTN_RECORD };
 
 static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
 {
@@ -4301,11 +3872,7 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
     bool pressed = (dis->itemState & ODS_SELECTED) != 0;
     bool toggled = (type == BTN_SHUFFLE && g_shuffle)
         || (type == BTN_REPEAT && g_repeatMode != 0)
-        || (type == BTN_MONO && g_mono)
-        || (type == BTN_NORMALIZE && g_normalize)
-        || (type == BTN_BASSBOOST && g_bassBoost)
         || (type == BTN_MEDIA && g_mediaActive)
-        || (type == BTN_DSP && !g_dspBypass && (g_dspReverb || g_dspSaturate || g_dspVinyl || g_dspHifi))
         || (type == BTN_RECORD && g_recording)
         ;
 
@@ -4384,10 +3951,6 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         DeleteObject(rb); DeleteObject(rp);
         break;
     }
-    case BTN_MONO:
-    case BTN_NORMALIZE:
-    case BTN_BASSBOOST:
-    case BTN_DSP:
     case BTN_SHUFFLE:
     case BTN_REPEAT:
     case BTN_MEDIA:
@@ -4408,11 +3971,7 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         switch (type) {
         case BTN_SHUFFLE:    lbl = L"随机"; break;
         case BTN_REPEAT:     lbl = (g_repeatMode == 1) ? L"单曲" : (g_repeatMode == 2) ? L"列表" : (g_repeatMode == 3) ? L"一次" : L"循环"; break;
-        case BTN_MONO:       lbl = L"单声道";    break;
-        case BTN_NORMALIZE:  lbl = L"响度";    break;
-        case BTN_BASSBOOST:  lbl = L"低音增强"; break;
         case BTN_MEDIA:      lbl = L"资料库"; break;
-        case BTN_DSP:        lbl = L"DSP";     break;
         case BTN_BACK:       lbl = L"\u2190";  break;  // ←
         // BTN_RECORD handled above as transport button (no border)
         default:             lbl = L"";        break;
@@ -4440,6 +3999,16 @@ LRESULT CALLBACK BtnHotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_hoveredBtn = NULL;
         InvalidateRect(hwnd, NULL, TRUE);
         UpdateWindow(hwnd);
+    }
+    // Right-click on transport buttons: bind a play-control hotkey (global/local)
+    if (msg == WM_RBUTTONUP) {
+        int fn = -1;
+        if (hwnd == hPlayBtn)       fn = 0;
+        else if (hwnd == hPauseBtn) fn = 1;
+        else if (hwnd == hStopBtn)  fn = 2;
+        else if (hwnd == hPrevBtn)  fn = 3;
+        else if (hwnd == hNextBtn)  fn = 4;
+        if (fn >= 0) { OpenHotkeyBindDialog(NULL, fn); return 0; }
     }
     // Right-click on Repeat button: show mode picker
     if (msg == WM_RBUTTONUP && hwnd == hRepeatBtn) {
@@ -6792,9 +6361,8 @@ static void RadioPlayStation(int idx)
     g_radioStream = stream;
     g_radioPlaying = true;
 
-    // Apply volume and DSP
+    // Apply volume
     BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
-    ApplyDSP();
     ApplyPitch();
     BASS_ChannelPlay(currentStream, FALSE);
 
@@ -7784,703 +7352,6 @@ void OpenAudioInfoForPath(const wchar_t* path)
 }
 
 // ============================================================
-//  Convert Dialog
-//  Bulk audio file converter with format/quality options
-// ============================================================
-
-struct ConvItem { wchar_t path[MAX_PATH]; wchar_t display[MAX_PATH]; };
-static std::vector<ConvItem> g_convItems;
-static wchar_t g_convOutDir[MAX_PATH] = L"";
-
-// ---- Conversion thread data ----
-struct ConvThreadData {
-    HWND                  hwnd;
-    std::vector<ConvItem> items;
-    wchar_t               outDir[MAX_PATH];
-    int                   fmt;           // 0=mp3,1=wav,2=flac,3=ogg,4=m4a
-    wchar_t               qualArgs[64];  // ffmpeg quality args, e.g. "-b:a 320k"
-    int                   wavBitDepth;   // WAV only: 16, 24, or 32
-    int                   outSampleRate; // 0=original, else target Hz (44100, 48000, etc.)
-    bool                  normalize;
-    bool                  copyMeta;
-};
-
-// Decode src to a 16-bit PCM WAV file via BASS (no external encoder needed)
-static bool ConvWriteWav(const wchar_t* src, const wchar_t* dst, bool normalize, int bitDepth = 16)
-{
-    if (bitDepth != 16 && bitDepth != 24 && bitDepth != 32) bitDepth = 16;
-    HSTREAM stream = BASS_StreamCreateFile(FALSE, src, 0, 0,
-        BASS_STREAM_DECODE | BASS_UNICODE | BASS_SAMPLE_FLOAT);
-    if (!stream) return false;
-
-    BASS_CHANNELINFO info = {};
-    BASS_ChannelGetInfo(stream, &info);
-
-    WORD  channels      = (WORD)info.chans;
-    DWORD sampleRate    = info.freq;
-    WORD  bitsPerSample = (WORD)bitDepth;
-    DWORD byteRate      = sampleRate * channels * (bitsPerSample / 8);
-    WORD  blockAlign    = channels * (bitsPerSample / 8);
-    WORD  fmtTag        = (bitDepth == 32) ? 3 : 1; // 3=IEEE_FLOAT, 1=PCM
-
-    // Buffer: 32768 bytes of float data at a time (safe: no overlap with BASS_DATA_FLOAT=0x40000000)
-    static const DWORD FBUF_BYTES = 32768;
-    float fbuf[FBUF_BYTES / sizeof(float)];
-
-    // Optional first pass: find peak level for normalization
-    float gainFactor = 1.0f;
-    if (normalize) {
-        float peak = 0.0f;
-        DWORD read;
-        while ((read = BASS_ChannelGetData(stream, fbuf, FBUF_BYTES | BASS_DATA_FLOAT)) != (DWORD)-1 && read > 0) {
-            int count = (int)(read / sizeof(float));
-            for (int i = 0; i < count; i++) {
-                float s = fabsf(fbuf[i]);
-                if (s > peak) peak = s;
-            }
-        }
-        if (peak > 0.001f) gainFactor = 0.98f / peak;
-        // Reopen for the writing pass
-        BASS_StreamFree(stream);
-        stream = BASS_StreamCreateFile(FALSE, src, 0, 0,
-            BASS_STREAM_DECODE | BASS_UNICODE | BASS_SAMPLE_FLOAT);
-        if (!stream) return false;
-    }
-
-    FILE* f = nullptr;
-    _wfopen_s(&f, dst, L"wb");
-    if (!f) { BASS_StreamFree(stream); return false; }
-
-    // Write placeholder WAV header (sizes filled in after encoding)
-    fwrite("RIFF", 1, 4, f);
-    DWORD riffSize = 0;          fwrite(&riffSize, 4, 1, f);
-    fwrite("WAVE", 1, 4, f);
-    fwrite("fmt ", 1, 4, f);
-    DWORD fmtSize = 16;          fwrite(&fmtSize,  4, 1, f);
-                                 fwrite(&fmtTag,    2, 1, f);
-    fwrite(&channels,      2, 1, f);
-    fwrite(&sampleRate,    4, 1, f);
-    fwrite(&byteRate,      4, 1, f);
-    fwrite(&blockAlign,    2, 1, f);
-    fwrite(&bitsPerSample, 2, 1, f);
-    fwrite("data", 1, 4, f);
-    DWORD dataSize = 0;
-    long  dataSizePos = ftell(f); fwrite(&dataSize, 4, 1, f);
-
-    // Second (or only) pass: decode and write samples at requested bit depth
-    DWORD read;
-    DWORD totalData = 0;
-    while ((read = BASS_ChannelGetData(stream, fbuf, FBUF_BYTES | BASS_DATA_FLOAT)) != (DWORD)-1 && read > 0) {
-        int count = (int)(read / sizeof(float));
-        if (bitDepth == 32) {
-            // 32-bit IEEE float — write float buffer directly (apply gain)
-            for (int i = 0; i < count; i++) {
-                fbuf[i] *= gainFactor;
-                if (fbuf[i] >  1.0f) fbuf[i] =  1.0f;
-                if (fbuf[i] < -1.0f) fbuf[i] = -1.0f;
-            }
-            DWORD written = (DWORD)fwrite(fbuf, sizeof(float), count, f) * sizeof(float);
-            totalData += written;
-        } else if (bitDepth == 24) {
-            // 24-bit PCM — 3 bytes per sample
-            for (int i = 0; i < count; i++) {
-                float s = fbuf[i] * gainFactor;
-                if (s >  1.0f) s =  1.0f;
-                if (s < -1.0f) s = -1.0f;
-                int32_t v = (int32_t)(s * 8388607.0f);
-                uint8_t b[3] = { (uint8_t)(v & 0xFF), (uint8_t)((v >> 8) & 0xFF), (uint8_t)((v >> 16) & 0xFF) };
-                fwrite(b, 1, 3, f);
-                totalData += 3;
-            }
-        } else {
-            // 16-bit PCM
-            short sbuf[FBUF_BYTES / sizeof(float)];
-            for (int i = 0; i < count; i++) {
-                float s = fbuf[i] * gainFactor;
-                if (s >  1.0f) s =  1.0f;
-                if (s < -1.0f) s = -1.0f;
-                sbuf[i] = (short)(s * 32767.0f);
-            }
-            DWORD written = (DWORD)fwrite(sbuf, 2, count, f) * 2;
-            totalData += written;
-        }
-    }
-
-    // Patch RIFF and data chunk sizes
-    fseek(f, 4, SEEK_SET);
-    DWORD riffFinal = 36 + totalData; fwrite(&riffFinal, 4, 1, f);
-    fseek(f, dataSizePos, SEEK_SET);  fwrite(&totalData, 4, 1, f);
-
-    fclose(f);
-    BASS_StreamFree(stream);
-    return (totalData > 0);
-}
-
-// Search for ffmpeg.exe next to the exe, then in PATH
-static bool ConvFindFfmpeg(wchar_t* outPath, int maxLen)
-{
-    wchar_t exeDir[MAX_PATH];
-    GetModuleFileNameW(NULL, exeDir, MAX_PATH);
-    wchar_t* slash = wcsrchr(exeDir, L'\\');
-    if (slash) { slash[1] = 0; swprintf_s(outPath, maxLen, L"%sffmpeg.exe", exeDir); }
-    else        { wcsncpy_s(outPath, maxLen, L"ffmpeg.exe", _TRUNCATE); }
-    if (GetFileAttributesW(outPath) != INVALID_FILE_ATTRIBUTES) return true;
-
-    wchar_t found[MAX_PATH];
-    if (SearchPathW(NULL, L"ffmpeg", L".exe", MAX_PATH, found, NULL)) {
-        wcsncpy_s(outPath, maxLen, found, _TRUNCATE);
-        return true;
-    }
-    return false;
-}
-
-// Run ffmpeg to encode src->dst with the given bitrate (and optional loudnorm)
-static bool ConvRunFfmpeg(const wchar_t* ffmpeg, const wchar_t* src, const wchar_t* dst,
-                           const wchar_t* qualArgs, bool normalize)
-{
-    wchar_t cmd[MAX_PATH * 3 + 256];
-    if (normalize)
-        swprintf_s(cmd, ARRAYSIZE(cmd),
-            L"\"%s\" -y -i \"%s\" -af loudnorm %s \"%s\"",
-            ffmpeg, src, qualArgs, dst);
-    else
-        swprintf_s(cmd, ARRAYSIZE(cmd),
-            L"\"%s\" -y -i \"%s\" %s \"%s\"",
-            ffmpeg, src, qualArgs, dst);
-
-    STARTUPINFOW si = {}; si.cb = sizeof(si);
-    si.dwFlags     = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi = {};
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-        return false;
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return (exitCode == 0);
-}
-
-// Background conversion thread
-static DWORD WINAPI ConvThreadProc(LPVOID param)
-{
-    ConvThreadData* d = (ConvThreadData*)param;
-    int total = (int)d->items.size();
-    int ok    = 0;
-
-    const wchar_t* exts[] = { L"mp3", L"wav", L"flac", L"ogg", L"m4a" };
-    const wchar_t* ext    = exts[d->fmt];
-    bool needFfmpeg = (d->fmt != 1); // WAV=1 is handled natively
-
-    wchar_t ffmpegPath[MAX_PATH] = L"";
-    bool hasFfmpeg = needFfmpeg ? ConvFindFfmpeg(ffmpegPath, MAX_PATH) : false;
-
-    for (int i = 0; i < total; i++) {
-        if (g_convAbort) break;
-
-        // Post progress (percent = files completed so far)
-        int pct = (i * 100) / total;
-        PostMessage(d->hwnd, WM_CONV_PROGRESS, (WPARAM)pct,
-                    (LPARAM)MAKELPARAM((WORD)(i + 1), (WORD)total));
-
-        // Build output path: strip extension, replace with target ext
-        const wchar_t* fn = Filename(d->items[i].path);
-        wchar_t base[MAX_PATH]; wcsncpy_s(base, fn, _TRUNCATE);
-        wchar_t* dot = wcsrchr(base, L'.'); if (dot) *dot = 0;
-
-        wchar_t outPath[MAX_PATH];
-        swprintf_s(outPath, ARRAYSIZE(outPath), L"%s\\%s.%s", d->outDir, base, ext);
-
-        bool success = false;
-        if (d->fmt == 1 && d->outSampleRate == 0) {
-            // WAV native (no resample needed)
-            success = ConvWriteWav(d->items[i].path, outPath, d->normalize, d->wavBitDepth);
-        } else if (d->fmt == 1 && d->outSampleRate > 0 && hasFfmpeg) {
-            // WAV with resample — use ffmpeg
-            wchar_t wavArgs[64];
-            const wchar_t* pcmFmt = (d->wavBitDepth == 32) ? L"f32le" :
-                                    (d->wavBitDepth == 24) ? L"s24le" : L"s16le";
-            swprintf_s(wavArgs, L"-ar %d -c:a pcm_%s", d->outSampleRate, pcmFmt);
-            success = ConvRunFfmpeg(ffmpegPath, d->items[i].path, outPath, wavArgs, d->normalize);
-        } else if (d->fmt == 1) {
-            // WAV no ffmpeg — native without resample
-            success = ConvWriteWav(d->items[i].path, outPath, d->normalize, d->wavBitDepth);
-        } else if (hasFfmpeg) {
-            success = ConvRunFfmpeg(ffmpegPath, d->items[i].path, outPath, d->qualArgs, d->normalize);
-        } else {
-            // No ffmpeg — fall back to WAV
-            wchar_t wavOut[MAX_PATH];
-            swprintf_s(wavOut, ARRAYSIZE(wavOut), L"%s\\%s.wav", d->outDir, base);
-            success = ConvWriteWav(d->items[i].path, wavOut, d->normalize, 16);
-        }
-        if (success) ok++;
-    }
-
-    PostMessage(d->hwnd, WM_CONV_DONE, (WPARAM)ok, (LPARAM)total);
-    delete d;
-    return 0;
-}
-
-// Repopulate the Quality combobox based on selected output format
-static void UpdateConvQuality(HWND hwndConv, int fmt)
-{
-    HWND hQ = GetDlgItem(hwndConv, ID_CONV_QUALITY);
-    if (!hQ) return;
-    SendMessage(hQ, CB_RESETCONTENT, 0, 0);
-    switch (fmt) {
-    case 0: // MP3
-    case 4: // AAC/M4A — same kbps options
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"320 kbps（最佳）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"256 kbps（高）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"192 kbps（良好）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"128 kbps（标准）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"96 kbps（紧凑）");
-        break;
-    case 1: // WAV
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"16-bit PCM（标准）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"24-bit PCM（高品质）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"32-bit Float（无损）");
-        break;
-    case 2: // FLAC
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"级别 8 - 最佳压缩");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"级别 5 - 默认");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"级别 0 - 最快");
-        break;
-    case 3: // OGG Vorbis
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"Q10（最佳）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"Q8（高）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"Q6（良好）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"Q4（标准）");
-        SendMessage(hQ, CB_ADDSTRING, 0, (LPARAM)  L"Q2（紧凑）");
-        break;
-    }
-    SendMessage(hQ, CB_SETCURSEL, 0, 0);
-}
-
-static LRESULT CALLBACK ConvertWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    switch (msg) {
-    case WM_CREATE: {
-        if (g_darkMode) { BOOL dk = TRUE; DwmSetWindowAttribute(hwnd, 20, &dk, sizeof(dk)); DwmSetWindowAttribute(hwnd, 19, &dk, sizeof(dk)); }
-        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
-        int cw = 700, ch = 580; (void)ch;
-
-        HWND hLbl1 = CreateWindow(L"STATIC", L"待转换文件:",
-            WS_CHILD | WS_VISIBLE, 8, 8, 200, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
-        SendMessage(hLbl1, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-
-        CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL,
-            8, 26, cw - 16, 200, hwnd, (HMENU)ID_CONV_LIST, hInst, NULL);
-        HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
-        SendMessage(hList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        SendMessage(hList, LB_SETITEMHEIGHT, 0, 18);
-
-        int bx = 8, by = 232, bh2 = 26;
-        HWND hAddPl = CreateWindow(L"BUTTON", L"+ 从播放列表",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, by, 130, bh2, hwnd, (HMENU)ID_CONV_ADDPLAYLIST, hInst, NULL);
-        SendMessage(hAddPl, WM_SETFONT, (WPARAM)g_fontUI, TRUE); bx += 134;
-        HWND hAddFld = CreateWindow(L"BUTTON", L"+ 添加文件夹...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, by, 120, bh2, hwnd, (HMENU)ID_CONV_ADDFOLDER, hInst, NULL);
-        SendMessage(hAddFld, WM_SETFONT, (WPARAM)g_fontUI, TRUE); bx += 124;
-        HWND hRem = CreateWindow(L"BUTTON", L"移除所选",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, by, 120, bh2, hwnd, (HMENU)ID_CONV_REMOVE, hInst, NULL);
-        SendMessage(hRem, WM_SETFONT, (WPARAM)g_fontUI, TRUE); bx += 124;
-        HWND hSelAll = CreateWindow(L"BUTTON", L"全选",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, bx, by, 90, bh2, hwnd, (HMENU)ID_CONV_SELECTALL, hInst, NULL);
-        SendMessage(hSelAll, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-
-        int oy = 270;
-        HWND hLbl2 = CreateWindow(L"STATIC", L"输出文件夹:",
-            WS_CHILD | WS_VISIBLE, 8, oy + 3, 100, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
-        SendMessage(hLbl2, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-        CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", g_convOutDir,
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_READONLY,
-            110, oy, cw - 210, 22, hwnd, (HMENU)ID_CONV_OUTDIR, hInst, NULL);
-        HWND hOutEd = GetDlgItem(hwnd, ID_CONV_OUTDIR);
-        SendMessage(hOutEd, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        HWND hBrowse = CreateWindow(L"BUTTON", L"浏览...",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, cw - 96, oy, 88, 26, hwnd, (HMENU)ID_CONV_BROWSE, hInst, NULL);
-        SendMessage(hBrowse, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-
-        int fo = 306;
-        HWND hLbl3 = CreateWindow(L"STATIC", L"输出格式:",
-            WS_CHILD | WS_VISIBLE, 8, fo + 3, 100, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
-        SendMessage(hLbl3, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-        HWND hFmt = CreateWindow(L"COMBOBOX", NULL,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 110, fo, 160, 120, hwnd, (HMENU)ID_CONV_FORMAT, hInst, NULL);
-        SendMessage(hFmt, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        SendMessage(hFmt, CB_ADDSTRING, 0, (LPARAM)L"MP3 (MPEG Layer-3)");
-        SendMessage(hFmt, CB_ADDSTRING, 0, (LPARAM)L"WAV（未压缩 PCM）");
-        SendMessage(hFmt, CB_ADDSTRING, 0, (LPARAM)L"FLAC（无损）");
-        SendMessage(hFmt, CB_ADDSTRING, 0, (LPARAM)L"OGG Vorbis");
-        SendMessage(hFmt, CB_ADDSTRING, 0, (LPARAM)L"AAC / M4A");
-        SendMessage(hFmt, CB_SETCURSEL, 0, 0);
-
-        HWND hLbl4 = CreateWindow(L"STATIC", L"质量:",
-            WS_CHILD | WS_VISIBLE, 284, fo + 3, 52, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
-        SendMessage(hLbl4, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-        HWND hQual = CreateWindow(L"COMBOBOX", NULL,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 338, fo, 160, 120, hwnd, (HMENU)ID_CONV_QUALITY, hInst, NULL);
-        SendMessage(hQual, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        UpdateConvQuality(hwnd, 0); // populate quality options for MP3 (default)
-
-        HWND hLbl5 = CreateWindow(L"STATIC", L"采样率:",
-            WS_CHILD | WS_VISIBLE, 510, fo + 3, 80, 16, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
-        SendMessage(hLbl5, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-        HWND hSR = CreateWindow(L"COMBOBOX", NULL,
-            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 594, fo, 96, 150, hwnd, (HMENU)ID_CONV_SRATE, hInst, NULL);
-        SendMessage(hSR, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        SendMessage(hSR, CB_ADDSTRING, 0, (LPARAM)L"原始");
-        SendMessage(hSR, CB_ADDSTRING, 0, (LPARAM)L"44.1 kHz");
-        SendMessage(hSR, CB_ADDSTRING, 0, (LPARAM)L"48.0 kHz");
-        SendMessage(hSR, CB_ADDSTRING, 0, (LPARAM)L"88.2 kHz");
-        SendMessage(hSR, CB_ADDSTRING, 0, (LPARAM)L"96.0 kHz");
-        SendMessage(hSR, CB_SETCURSEL, 0, 0);
-
-        int optY = fo + 28;
-        HWND hNorm = CreateWindow(L"BUTTON", L"标准化音频响度",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 8, optY, 150, 18, hwnd, (HMENU)ID_CONV_NORMALIZE, hInst, NULL);
-        SendMessage(hNorm, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        HWND hMeta = CreateWindow(L"BUTTON", L"复制元数据标签",
-            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 170, optY, 150, 18, hwnd, (HMENU)ID_CONV_METADATA, hInst, NULL);
-        SendMessage(hMeta, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-        SendMessage(hMeta, BM_SETCHECK, BST_CHECKED, 0);
-
-        int py = 350;
-        HWND hProg = CreateWindowEx(0, PROGRESS_CLASS, NULL,
-            WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 8, py, cw - 16, 20, hwnd, (HMENU)ID_CONV_PROGRESS, hInst, NULL);
-        SendMessage(hProg, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-
-        HWND hStat = CreateWindow(L"STATIC", L"就绪。添加文件并选择输出文件夹即可开始。",
-            WS_CHILD | WS_VISIBLE | SS_LEFT, 8, 374, cw - 16, 36, hwnd, (HMENU)ID_CONV_STATUS, hInst, NULL);
-        SendMessage(hStat, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-
-        int bby2 = 420;
-        HWND hStart = CreateWindow(L"BUTTON", L"开始转换",
-            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 8, bby2, 200, 32, hwnd, (HMENU)ID_CONV_START, hInst, NULL);
-        SendMessage(hStart, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
-        HWND hClosC = CreateWindow(L"BUTTON", L"关闭",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, cw - 100, bby2, 92, 32, hwnd, (HMENU)ID_CONV_CLOSE, hInst, NULL);
-        SendMessage(hClosC, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-
-        // Pre-populate with current playlist
-        g_convItems.clear();
-        for (auto& t : g_playlist) {
-            ConvItem ci; wcsncpy_s(ci.path, t.path, _TRUNCATE);
-            wcsncpy_s(ci.display, t.display, _TRUNCATE);
-            g_convItems.push_back(ci);
-            SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display);
-        }
-        wchar_t sb[64]; swprintf_s(sb, L"已从当前播放列表载入 %d 个文件。", (int)g_convItems.size());
-        SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
-
-        DragAcceptFiles(hwnd, TRUE);  // enable drag & drop onto the convert window
-        break;
-    }
-    case WM_DROPFILES: {
-        HDROP hd = (HDROP)wParam;
-        UINT n = DragQueryFile(hd, 0xFFFFFFFF, NULL, 0);
-        HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
-        int added = 0;
-        for (UINT i = 0; i < n; i++) {
-            wchar_t p[MAX_PATH]; DragQueryFile(hd, i, p, MAX_PATH);
-            DWORD attr = GetFileAttributes(p);
-            if (attr == INVALID_FILE_ATTRIBUTES) continue;
-            if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-                // Add all audio files in the dropped folder
-                wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", p);
-                WIN32_FIND_DATA fd; HANDLE hf = FindFirstFile(pat, &fd);
-                if (hf != INVALID_HANDLE_VALUE) {
-                    do {
-                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                            wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", p, fd.cFileName);
-                            if (IsAudio(full)) {
-                                bool dup = false;
-                                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, full) == 0) { dup = true; break; }
-                                if (!dup) {
-                                    ConvItem ci; wcsncpy_s(ci.path, full, _TRUNCATE);
-                                    wcsncpy_s(ci.display, Filename(full), _TRUNCATE);
-                                    g_convItems.push_back(ci);
-                                    SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display);
-                                    added++;
-                                }
-                            }
-                        }
-                    } while (FindNextFile(hf, &fd));
-                    FindClose(hf);
-                }
-            } else if (IsAudio(p)) {
-                bool dup = false;
-                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, p) == 0) { dup = true; break; }
-                if (!dup) {
-                    ConvItem ci; wcsncpy_s(ci.path, p, _TRUNCATE);
-                    wcsncpy_s(ci.display, Filename(p), _TRUNCATE);
-                    g_convItems.push_back(ci);
-                    SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display);
-                    added++;
-                }
-            }
-        }
-        DragFinish(hd);
-        wchar_t sb2[128]; swprintf_s(sb2, L"已通过拖放添加 %d 个文件，共计 %d 个。", added, (int)g_convItems.size());
-        SetDlgItemText(hwnd, ID_CONV_STATUS, sb2);
-        break;
-    }
-    case WM_COMMAND:
-        if (LOWORD(wParam) == ID_CONV_FORMAT && HIWORD(wParam) == CBN_SELCHANGE) {
-            int fmt = (int)SendMessage((HWND)lParam, CB_GETCURSEL, 0, 0);
-            if (fmt < 0) fmt = 0;
-            UpdateConvQuality(hwnd, fmt);
-            break;
-        }
-        switch (LOWORD(wParam)) {
-        case ID_CONV_ADDPLAYLIST: {
-            HWND hList = GetDlgItem(hwnd, ID_CONV_LIST); int added = 0;
-            for (auto& t : g_playlist) {
-                bool dup = false;
-                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, t.path) == 0) { dup = true; break; }
-                if (!dup) {
-                    ConvItem ci; wcsncpy_s(ci.path, t.path, _TRUNCATE);
-                    wcsncpy_s(ci.display, t.display, _TRUNCATE);
-                    g_convItems.push_back(ci); SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display); added++;
-                }
-            }
-            wchar_t sb[128]; swprintf_s(sb, L"已从播放列表添加 %d 个文件，共计 %d 个。", added, (int)g_convItems.size());
-            SetDlgItemText(hwnd, ID_CONV_STATUS, sb); break;
-        }
-        case ID_CONV_ADDFOLDER: {
-            wchar_t folder[MAX_PATH] = {};
-            if (PickFolder(hwnd, L"选择要添加的文件夹", folder, MAX_PATH)) {
-                wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", folder);
-                WIN32_FIND_DATA fd; HANDLE h = FindFirstFile(pat, &fd); int added = 0;
-                HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
-                if (h != INVALID_HANDLE_VALUE) {
-                    do {
-                        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                            wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", folder, fd.cFileName);
-                            if (IsAudio(full)) {
-                                bool dup = false;
-                                for (auto& ci : g_convItems) if (_wcsicmp(ci.path, full) == 0) { dup = true; break; }
-                                if (!dup) {
-                                    ConvItem ci; wcsncpy_s(ci.path, full, _TRUNCATE);
-                                    wcsncpy_s(ci.display, Filename(full), _TRUNCATE);
-                                    g_convItems.push_back(ci); SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)ci.display); added++;
-                                }
-                            }
-                        }
-                    } while (FindNextFile(h, &fd)); FindClose(h);
-                }
-                wchar_t sb[128]; swprintf_s(sb, L"已从文件夹添加 %d 个文件，共计 %d 个。", added, (int)g_convItems.size());
-                SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
-            }
-            break;
-        }
-        case ID_CONV_REMOVE: {
-            HWND hList = GetDlgItem(hwnd, ID_CONV_LIST);
-            int total = (int)SendMessage(hList, LB_GETCOUNT, 0, 0);
-            std::vector<int> sel;
-            for (int i = 0; i < total; i++) if (SendMessage(hList, LB_GETSEL, i, 0) > 0) sel.push_back(i);
-            std::sort(sel.begin(), sel.end(), std::greater<int>());
-            for (int idx : sel) {
-                SendMessage(hList, LB_DELETESTRING, idx, 0);
-                if (idx < (int)g_convItems.size()) g_convItems.erase(g_convItems.begin() + idx);
-            }
-            wchar_t sb[64]; swprintf_s(sb, L"队列中共有 %d 个文件。", (int)g_convItems.size());
-            SetDlgItemText(hwnd, ID_CONV_STATUS, sb); break;
-        }
-        case ID_CONV_SELECTALL:
-            SendMessage(GetDlgItem(hwnd, ID_CONV_LIST), LB_SETSEL, TRUE, (LPARAM)-1); break;
-        case ID_CONV_BROWSE: {
-            wchar_t outDir[MAX_PATH] = {};
-            if (PickFolder(hwnd, L"选择输出文件夹", outDir, MAX_PATH)) {
-                wcsncpy_s(g_convOutDir, outDir, _TRUNCATE);
-                SetDlgItemText(hwnd, ID_CONV_OUTDIR, g_convOutDir);
-            }
-            break;
-        }
-        case ID_CONV_START: {
-            if (g_convRunning) { MessageBox(hwnd, L"已有转换任务正在进行。", L"转换", MB_ICONWARNING); break; }
-            if (g_convItems.empty()) { MessageBox(hwnd, L"没有可转换的文件。", L"转换", MB_ICONWARNING); break; }
-            if (!g_convOutDir[0]) { MessageBox(hwnd, L"请先选择输出文件夹。", L"转换", MB_ICONWARNING); break; }
-
-            int fmt  = (int)SendMessage(GetDlgItem(hwnd, ID_CONV_FORMAT),  CB_GETCURSEL, 0, 0);
-            int qual = (int)SendMessage(GetDlgItem(hwnd, ID_CONV_QUALITY), CB_GETCURSEL, 0, 0);
-            int srSel = (int)SendMessage(GetDlgItem(hwnd, ID_CONV_SRATE), CB_GETCURSEL, 0, 0);
-            if (fmt  < 0 || fmt  >= 5) fmt  = 0;
-            if (qual < 0) qual = 0;
-            // 0=Original, 1=44100, 2=48000, 3=88200, 4=96000
-            const int srOpts[] = { 0, 44100, 48000, 88200, 96000 };
-            int outSR = (srSel >= 0 && srSel < 5) ? srOpts[srSel] : 0;
-            bool normalize = (SendMessage(GetDlgItem(hwnd, ID_CONV_NORMALIZE), BM_GETCHECK, 0, 0) == BST_CHECKED);
-            bool copyMeta  = (SendMessage(GetDlgItem(hwnd, ID_CONV_METADATA),  BM_GETCHECK, 0, 0) == BST_CHECKED);
-
-            // Warn if a compressed format was chosen but ffmpeg is not available
-            if (fmt != 1) {
-                wchar_t ffPath[MAX_PATH];
-                if (!ConvFindFfmpeg(ffPath, MAX_PATH)) {
-                    const wchar_t* fmtLabels[] = { L"MP3", L"WAV", L"FLAC", L"OGG", L"AAC/M4A" };
-                    wchar_t msg[512];
-                    swprintf_s(msg, ARRAYSIZE(msg),
-                        L"本系统未找到 FFmpeg。\n\n"
-                        L"%s 编码需要 FFmpeg（ffmpeg.exe）。\n\n"
-                        L"文件将改为转换为 WAV（无损 PCM）。\n\n"
-                        L"如需启用 %s 输出，请将 ffmpeg.exe 放在 BillyPro.exe 同一目录，"
-                        L"或加入系统 PATH。\n\n仍使用 WAV 输出继续吗？",
-                        fmtLabels[fmt], fmtLabels[fmt]);
-                    if (MessageBox(hwnd, msg, L"未找到 FFmpeg", MB_YESNO | MB_ICONWARNING) != IDYES)
-                        break;
-                }
-            }
-
-            // Package data for the worker thread (owns a copy of the item list)
-            ConvThreadData* d = new ConvThreadData();
-            d->hwnd        = hwnd;
-            d->items       = g_convItems;
-            wcsncpy_s(d->outDir, g_convOutDir, _TRUNCATE);
-            d->fmt           = fmt;
-            d->normalize     = normalize;
-            d->copyMeta      = copyMeta;
-            d->wavBitDepth   = 16;
-            d->outSampleRate = outSR;
-            d->qualArgs[0]   = L'\0';
-            switch (fmt) {
-            case 0: { // MP3
-                const wchar_t* a[] = { L"-b:a 320k", L"-b:a 256k", L"-b:a 192k", L"-b:a 128k", L"-b:a 96k" };
-                int q = min(qual, 4); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
-            }
-            case 1: { // WAV
-                const int bits[] = { 16, 24, 32 };
-                int q = min(qual, 2); d->wavBitDepth = bits[q]; break;
-            }
-            case 2: { // FLAC
-                const wchar_t* a[] = { L"-compression_level 8", L"-compression_level 5", L"-compression_level 0" };
-                int q = min(qual, 2); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
-            }
-            case 3: { // OGG Vorbis
-                const wchar_t* a[] = { L"-q:a 10", L"-q:a 8", L"-q:a 6", L"-q:a 4", L"-q:a 2" };
-                int q = min(qual, 4); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
-            }
-            case 4: { // AAC/M4A
-                const wchar_t* a[] = { L"-b:a 320k", L"-b:a 256k", L"-b:a 192k", L"-b:a 128k", L"-b:a 96k" };
-                int q = min(qual, 4); wcsncpy_s(d->qualArgs, a[q], _TRUNCATE); break;
-            }
-            }
-            // Append sample rate arg for ffmpeg (non-WAV formats)
-            if (outSR > 0 && fmt != 1) {
-                wchar_t arBuf[32];
-                swprintf_s(arBuf, L" -ar %d", outSR);
-                wcsncat_s(d->qualArgs, arBuf, _TRUNCATE);
-            }
-
-            g_convAbort      = false;
-            g_convRunning    = true;
-            g_convStartTick  = GetTickCount();
-            EnableWindow(GetDlgItem(hwnd, ID_CONV_START), FALSE);
-            EnableWindow(GetDlgItem(hwnd, ID_CONV_CLOSE), FALSE);
-            SendMessage(GetDlgItem(hwnd, ID_CONV_PROGRESS), PBM_SETPOS, 0, 0);
-            SetDlgItemText(hwnd, ID_CONV_STATUS, L"正在开始转换...");
-
-            if (g_convThread) { CloseHandle(g_convThread); g_convThread = NULL; }
-            g_convThread = CreateThread(NULL, 0, ConvThreadProc, d, 0, NULL);
-            if (!g_convThread) {
-                g_convRunning = false;
-                EnableWindow(GetDlgItem(hwnd, ID_CONV_START), TRUE);
-                EnableWindow(GetDlgItem(hwnd, ID_CONV_CLOSE), TRUE);
-                delete d;
-                MessageBox(hwnd, L"转换线程启动失败。", L"错误", MB_ICONERROR);
-            }
-            break;
-        }
-        case ID_CONV_CLOSE:
-        case IDCANCEL:
-            if (g_convRunning) {
-                if (MessageBox(hwnd, L"转换正在进行中。要中止并关闭吗？",
-                               L"转换", MB_YESNO | MB_ICONWARNING) != IDYES) break;
-                g_convAbort = true;
-            }
-            DestroyWindow(hwnd);
-            break;
-        }
-        break;
-
-    case WM_CONV_PROGRESS: {
-        int pct       = (int)wParam;
-        int fileIdx   = (int)LOWORD(lParam);
-        int fileTotal = (int)HIWORD(lParam);
-        SendMessage(GetDlgItem(hwnd, ID_CONV_PROGRESS), PBM_SETPOS, pct, 0);
-        DWORD elapsed = (GetTickCount() - g_convStartTick) / 1000;
-        int eMin = (int)(elapsed / 60), eSec = (int)(elapsed % 60);
-        const wchar_t* fn = (fileIdx >= 1 && fileIdx <= (int)g_convItems.size())
-            ? Filename(g_convItems[fileIdx - 1].path) : L"";
-        wchar_t sb[320];
-        if (eMin > 0)
-            swprintf_s(sb, ARRAYSIZE(sb), L"[%d:%02d] (%d/%d, %d%%) %s",
-                       eMin, eSec, fileIdx, fileTotal, pct, fn);
-        else
-            swprintf_s(sb, ARRAYSIZE(sb), L"[%ds] (%d/%d, %d%%) %s",
-                       eSec, fileIdx, fileTotal, pct, fn);
-        SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
-        return 0;
-    }
-    case WM_CONV_DONE: {
-        int ok    = (int)wParam;
-        int total = (int)lParam;
-        SendMessage(GetDlgItem(hwnd, ID_CONV_PROGRESS), PBM_SETPOS, 100, 0);
-        wchar_t sb[128];
-        if (g_convAbort)
-            swprintf_s(sb, ARRAYSIZE(sb), L"转换已取消。已完成 %d/%d 个文件。", ok, total);
-        else
-            swprintf_s(sb, ARRAYSIZE(sb), L"完成。已成功转换 %d/%d 个文件。", ok, total);
-        SetDlgItemText(hwnd, ID_CONV_STATUS, sb);
-        EnableWindow(GetDlgItem(hwnd, ID_CONV_START), TRUE);
-        EnableWindow(GetDlgItem(hwnd, ID_CONV_CLOSE), TRUE);
-        if (g_convThread) { CloseHandle(g_convThread); g_convThread = NULL; }
-        g_convRunning = false;
-        return 0;
-    }
-    case WM_ERASEBKGND: {
-        HDC dc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc);
-        FillRect(dc, &rc, g_brBg); return 1;
-    }
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLOREDIT: {
-        HDC dc = (HDC)wParam;
-        SetTextColor(dc, g_theme.text);
-        SetBkColor(dc, g_theme.bg);
-        return (LRESULT)g_brBg;
-    }
-    case WM_CTLCOLORLISTBOX: {
-        HDC dc = (HDC)wParam;
-        SetTextColor(dc, g_theme.text);
-        SetBkColor(dc, g_theme.bgList);
-        return (LRESULT)g_brList;
-    }
-    case WM_KEYDOWN: if (wParam == VK_ESCAPE && !g_convRunning) DestroyWindow(hwnd); break;
-    case WM_DESTROY:
-        g_convAbort = true;
-        if (g_convThread) {
-            WaitForSingleObject(g_convThread, 8000);
-            CloseHandle(g_convThread);
-            g_convThread = NULL;
-        }
-        g_convRunning = false;
-        g_hwndConvert = NULL;
-        break;
-    case WM_CLOSE:
-        if (g_convRunning) {
-            if (MessageBox(hwnd, L"转换正在进行中。要中止并关闭吗？",
-                           L"转换", MB_YESNO | MB_ICONWARNING) != IDYES) return 0;
-            g_convAbort = true;
-        }
-        DestroyWindow(hwnd);
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-// ============================================================
 //  File Associations dialog
 // ============================================================
 static const wchar_t* s_audioExts[] = {
@@ -8938,10 +7809,6 @@ static void SmtcCleanup()
 //  Options dialog — Billy-style sidebar layout
 // ─────────────────────────────────────────────────────────────────────────────
 #define ID_OPT_NAVLIST      612
-#define ID_OPT_BB_ENABLE    601
-#define ID_OPT_BB_LOW       602
-#define ID_OPT_BB_HIGH      603
-#define ID_OPT_BB_GAIN      604
 #define ID_OPT_MULTIINST    605
 #define ID_OPT_DROP_APPEND  606
 #define ID_OPT_DROP_REPLACE 607
@@ -8957,11 +7824,6 @@ static void SmtcCleanup()
 #define ID_OPT_DEVICE_COMBO  626
 #define ID_OPT_DEVICE_RESET  627
 #define ID_OPT_REMEMBER_VOL  628
-#define ID_OPT_MEDIA_PATH    628
-#define ID_OPT_MEDIA_BROWSE  629
-#define ID_OPT_MEDIA_LIST    633
-#define ID_OPT_MEDIA_ADD     634
-#define ID_OPT_MEDIA_REMOVE  635
 #define ID_OPT_PITCH_ENABLE  630
 #define ID_OPT_PITCH_VALUE   631
 #define ID_OPT_RESET         632
@@ -8970,22 +7832,8 @@ static void SmtcCleanup()
 #define ID_OPT_MODERN_SIZE   639
 #define ID_OPT_REC_PATH      653
 #define ID_OPT_REC_BROWSE    654
-#define ID_OPT_REVERB        640
-#define ID_OPT_SATURATE      641
-#define ID_OPT_VINYL         642
-#define ID_OPT_HIFI          643
-#define ID_OPT_REV_MIX       644
-#define ID_OPT_REV_ROOM      645
-#define ID_OPT_REV_WIDTH     652
-#define ID_OPT_SAT_DRIVE     646
-#define ID_OPT_SAT_LEVEL     647
-#define ID_OPT_VIN_FREQ      648
-#define ID_OPT_VIN_CRACK     649
-#define ID_OPT_HFI_BASS      650
-#define ID_OPT_HFI_WARM      651
 #define ID_OPT_SESSION_OFF    655
 #define ID_OPT_SESSION_TRACK  656
-#define ID_OPT_SESSION_SEEK   657
 #define ID_OPT_DROP_LOADDIR   658
 #define ID_OPT_MICOUT_ENABLE   661
 #define ID_OPT_MICOUT_ONLY     662
@@ -8993,7 +7841,7 @@ static void SmtcCleanup()
 #define ID_OPT_MICOUT_COMBO    664
 #define ID_OPT_MICOUT_STATUS   665
 
-static HWND s_optPanels[6] = {};
+static HWND s_optPanels[4] = {};
 static int  s_optPage = 0;
 
 static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -9079,7 +7927,7 @@ static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static void OptSwitchPage(int page)
 {
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 4; i++)
         if (s_optPanels[i]) ShowWindow(s_optPanels[i], i == page ? SW_SHOW : SW_HIDE);
     s_optPage = page;
 }
@@ -9172,11 +8020,10 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             WS_CHILD|WS_VISIBLE|WS_BORDER|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_TABSTOP,
             GAP, GAP, SB_W, PNL_H, hwnd, (HMENU)ID_OPT_NAVLIST, hInst, NULL);
         SendMessage(hNav, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        SendMessage(hNav, LB_SETITEMHEIGHT, 0, 30);   // roomier tab rows
         SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"设置");
         SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"显示");
-        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"音频");
         SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"设备");
-        SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"媒体");
         SendMessage(hNav, LB_ADDSTRING, 0, (LPARAM)L"变速");
         SendMessage(hNav, LB_SETCURSEL, 0, 0);
 
@@ -9219,13 +8066,11 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 L"拖入文件时加载其所在整个文件夹", g_dropLoadDir);
 
             grp(p, 0, 290, w, 92, L"记住会话");
-            { HWND h = rad(p, 10, 308, w - 20, 20, ID_OPT_SESSION_OFF,
-                L"不记住", g_rememberSession == 0);
+            { HWND h = rad(p, 10, 308, w - 20, 20, ID_OPT_SESSION_TRACK,
+                L"记住播放列表和曲目（默认）", g_rememberSession != 0);
               SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
-            rad(p, 10, 328, w - 20, 20, ID_OPT_SESSION_TRACK,
-                L"记住播放列表和曲目", g_rememberSession == 1);
-            rad(p, 10, 348, w - 20, 20, ID_OPT_SESSION_SEEK,
-                L"记住播放列表、曲目和进度位置", g_rememberSession == 2);
+            rad(p, 10, 328, w - 20, 20, ID_OPT_SESSION_OFF,
+                L"不记住", g_rememberSession == 0);
         }
 
         // ── Page 1: Display ───────────────────────────────────────────────
@@ -9251,65 +8096,11 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             lbl(p, 10, 106, w - 20, 14, L"需在“查看”菜单中开启现代风格才能显示封面。");
         }
 
-        // ── Page 2: Audio ─────────────────────────────────────────────────
-        {
-            HWND p = mkPanel(false);
-            s_optPanels[2] = p;
-            int w = PNL_W - 4;
-            wchar_t buf[32];
-            grp(p, 0, 0, w, 130, L"低音增强");
-            chk(p, 10, 18, w - 20, 22, ID_OPT_BB_ENABLE, L"启用低音增强", g_bassBoost);
-            lbl(p, 20, 46, 120, 16, L"低频 (Hz):");
-            swprintf_s(buf, L"%.1f", g_bbFreqLow);
-            edt(p, 155, 44, 90, 20, ID_OPT_BB_LOW, buf);
-            lbl(p, 20, 70, 120, 16, L"高频 (Hz):");
-            swprintf_s(buf, L"%.1f", g_bbFreqHigh);
-            edt(p, 155, 68, 90, 20, ID_OPT_BB_HIGH, buf);
-            lbl(p, 20, 94, 120, 16, L"增益 (dB):");
-            swprintf_s(buf, L"%.1f", g_bbGainDB);
-            edt(p, 155, 92, 90, 20, ID_OPT_BB_GAIN, buf);
-
-            // Reverb
-            grp(p, 0, 138, w, 96, L"Reverb");
-            chk(p, 10, 154, w - 20, 20, ID_OPT_REVERB, L"启用混响（房间氛围）", g_dspReverb);
-            lbl(p, 10, 180, 44, 16, L"混合 %:");
-            swprintf_s(buf, L"%.0f", g_revMix);   edt(p, 56,  178, 46, 20, ID_OPT_REV_MIX,   buf);
-            lbl(p, 108, 180, 52, 16, L"房间 %:");
-            swprintf_s(buf, L"%.0f", g_revRoom);  edt(p, 162, 178, 46, 20, ID_OPT_REV_ROOM,  buf);
-            lbl(p, 214, 180, 54, 16, L"宽度 %:");
-            swprintf_s(buf, L"%.0f", g_revWidth); edt(p, 270, 178, 50, 20, ID_OPT_REV_WIDTH, buf);
-            lbl(p, 20, 202, w - 30, 14, L"宽度 0 = 单声道混响，100 = 完全立体声。");
-
-            // Saturation
-            grp(p, 0, 242, w, 70, L"饱和度");
-            chk(p, 10, 258, w - 20, 20, ID_OPT_SATURATE, L"启用饱和（电子管温暖感）", g_dspSaturate);
-            lbl(p, 20, 284, 44, 16, L"驱动:");
-            swprintf_s(buf, L"%.1f", g_satDrive);  edt(p, 66, 282, 52, 20, ID_OPT_SAT_DRIVE, buf);
-            lbl(p, 130, 284, 54, 16, L"电平 %:");
-            swprintf_s(buf, L"%.0f", g_satLevel);  edt(p, 186, 282, 52, 20, ID_OPT_SAT_LEVEL, buf);
-
-            // Vinyl
-            grp(p, 0, 320, w, 70, L"黑胶模拟");
-            chk(p, 10, 336, w - 20, 20, ID_OPT_VINYL, L"启用黑胶（高频衰减 + 爆豆声）", g_dspVinyl);
-            lbl(p, 20, 362, 44, 16, L"LP Hz:");
-            swprintf_s(buf, L"%.0f", g_vinLpFreq);  edt(p, 66, 360, 60, 20, ID_OPT_VIN_FREQ,  buf);
-            lbl(p, 138, 362, 58, 16, L"爆豆声 %:");
-            swprintf_s(buf, L"%.0f", g_vinCrackle); edt(p, 198, 360, 52, 20, ID_OPT_VIN_CRACK, buf);
-
-            // HiFi Amplifier
-            grp(p, 0, 398, w, 70, L"HiFi 功放");
-            chk(p, 10, 414, w - 20, 20, ID_OPT_HIFI, L"启用 HiFi 功放（低音搁架 + 温暖感）", g_dspHifi);
-            lbl(p, 20, 440, 52, 16, L"低音 dB:");
-            swprintf_s(buf, L"%.1f", g_hfiBassDb); edt(p, 74, 438, 52, 20, ID_OPT_HFI_BASS, buf);
-            lbl(p, 138, 440, 60, 16, L"温暖 %:");
-            swprintf_s(buf, L"%.0f", g_hfiWarmth); edt(p, 200, 438, 52, 20, ID_OPT_HFI_WARM, buf);
-
-        }
 
         // ── Page 3: Device ────────────────────────────────────────────────
         {
             HWND p = mkPanel(false);
-            s_optPanels[3] = p;
+            s_optPanels[2] = p;
             int w = PNL_W - 4;
             grp(p, 0, 0, w, 130, L"音频输出");
             lbl(p, 10, 20, w - 20, 16, L"输出设备:");
@@ -9398,29 +8189,11 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             lbl(p, 10, 414, w - 16, 36, L"语音软件里把输入设备选为 “CABLE Output”:\r\n没装? 到 vb-audio.com/Cable 免费下载。");
         }
 
-        // ── Page 4: Media ─────────────────────────────────────────────────
-        {
-            HWND p = mkPanel(false);
-            s_optPanels[4] = p;
-            int w = PNL_W - 4;
-            grp(p, 0, 0, w, 180, L"媒体文件夹");
-            lbl(p, 10, 20, w - 20, 16, L"\u2605 浏览器中显示的文件夹（可添加多个）:");
-            // Listbox of configured folders
-            HWND hList = CreateWindowEx(WS_EX_CLIENTEDGE, L"LISTBOX", NULL,
-                WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP,
-                10, 38, w - 20, 100, p, (HMENU)ID_OPT_MEDIA_LIST, hInst, NULL);
-            SendMessage(hList, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
-            for (auto& f : g_mediaFolders)
-                SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)f.c_str());
-            btn(p, 10,        144, 90, 24, ID_OPT_MEDIA_ADD,    L"添加文件夹...");
-            btn(p, 106,       144, 90, 24, ID_OPT_MEDIA_REMOVE, L"移除");
-            lbl(p, 10, 168, w - 20, 14, L"按主工具栏上的 \u2605 按钮浏览。");
-        }
 
         // ── Page 5: Timestretch ───────────────────────────────────────────
         {
             HWND p = mkPanel(false);
-            s_optPanels[5] = p;
+            s_optPanels[3] = p;
             int w = PNL_W - 4;
             grp(p, 0, 0, w, 150, L"音调 / 速度（CDJ 风格）");
             chk(p, 10, 20, w - 20, 20, ID_OPT_PITCH_ENABLE, L"启用变调（同时改变音调和速度）", g_pitchEnabled);
@@ -9456,9 +8229,9 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
     case WM_COMMAND:
         // EN_CHANGE on pitch value edit — sync slider position
-        if (LOWORD(wParam) == ID_OPT_PITCH_VALUE && HIWORD(wParam) == EN_CHANGE && s_optPanels[5]) {
-            HWND hEdit   = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_VALUE);
-            HWND hSlider = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_SLIDER);
+        if (LOWORD(wParam) == ID_OPT_PITCH_VALUE && HIWORD(wParam) == EN_CHANGE && s_optPanels[3]) {
+            HWND hEdit   = GetDlgItem(s_optPanels[3], ID_OPT_PITCH_VALUE);
+            HWND hSlider = GetDlgItem(s_optPanels[3], ID_OPT_PITCH_SLIDER);
             if (hEdit && hSlider) {
                 wchar_t buf[16] = {}; GetWindowText(hEdit, buf, 16);
                 float v = max(-12.0f, min(12.0f, (float)_wtof(buf)));
@@ -9471,51 +8244,9 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_OPT_NAVLIST:
             if (HIWORD(wParam) == LBN_SELCHANGE) {
                 int sel = (int)SendMessage(GetDlgItem(hwnd, ID_OPT_NAVLIST), LB_GETCURSEL, 0, 0);
-                if (sel >= 0 && sel < 6) OptSwitchPage(sel);
+                if (sel >= 0 && sel < 4) OptSwitchPage(sel);
             }
             break;
-
-        case ID_OPT_MEDIA_ADD: {
-            wchar_t folder[MAX_PATH] = {};
-            if (PickFolder(hwnd, L"选择媒体文件夹", folder, MAX_PATH)) {
-                // Avoid duplicates
-                bool dup = false;
-                for (auto& f : g_mediaFolders) if (_wcsicmp(f.c_str(), folder) == 0) { dup = true; break; }
-                if (!dup) {
-                    g_mediaFolders.push_back(folder);
-                    wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
-                    if (s_optPanels[4]) {
-                        HWND hList = GetDlgItem(s_optPanels[4], ID_OPT_MEDIA_LIST);
-                        SendMessage(hList, LB_ADDSTRING, 0, (LPARAM)folder);
-                    }
-                    LayoutControls(g_hwnd);
-                }
-            }
-            break;
-        }
-        case ID_OPT_MEDIA_REMOVE: {
-            if (!s_optPanels[4]) break;
-            HWND hList = GetDlgItem(s_optPanels[4], ID_OPT_MEDIA_LIST);
-            int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
-            if (sel == LB_ERR) break;
-            if (sel >= 0 && sel < (int)g_mediaFolders.size()) {
-                g_mediaFolders.erase(g_mediaFolders.begin() + sel);
-                SendMessage(hList, LB_DELETESTRING, sel, 0);
-                // Sync g_mediaFolder
-                if (!g_mediaFolders.empty())
-                    wcsncpy_s(g_mediaFolder, g_mediaFolders[0].c_str(), _TRUNCATE);
-                else
-                    g_mediaFolder[0] = L'\0';
-                // If browser was active and now no folders, deactivate it
-                if (g_mediaFolders.empty() && g_mediaActive) {
-                    g_mediaActive = false;
-                    g_browserActive = false;
-                    g_browserItems.clear();
-                }
-                LayoutControls(g_hwnd);
-            }
-            break;
-        }
 
         case ID_OPT_FILEASSOC: {
             // Register checked file types directly
@@ -9555,13 +8286,13 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_OPT_REC_BROWSE: {
             wchar_t folder[MAX_PATH] = {};
             if (PickFolder(hwnd, L"选择录音保存文件夹", folder, MAX_PATH)) {
-                SetDlgItemText(s_optPanels[3], ID_OPT_REC_PATH, folder);
+                SetDlgItemText(s_optPanels[2], ID_OPT_REC_PATH, folder);
             }
             break;
         }
         case ID_OPT_DEVICE_RESET: {
-            if (!s_optPanels[3]) break;
-            HWND hCombo = GetDlgItem(s_optPanels[3], ID_OPT_DEVICE_COMBO);
+            if (!s_optPanels[2]) break;
+            HWND hCombo = GetDlgItem(s_optPanels[2], ID_OPT_DEVICE_COMBO);
             int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
             if (sel == CB_ERR) break;
             int devIdx = (int)SendMessage(hCombo, CB_GETITEMDATA, sel, 0);
@@ -9595,30 +8326,6 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         case ID_OPT_SAVE: {
             wchar_t buf[32];
             bool wasMicEnabled = g_micOutEnabled;
-            // Audio page
-            GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_LOW),  buf, 32); float lo = (float)_wtof(buf);
-            GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_HIGH), buf, 32); float hi = (float)_wtof(buf);
-            GetWindowText(GetDlgItem(s_optPanels[2], ID_OPT_BB_GAIN), buf, 32); float gn = (float)_wtof(buf);
-            g_bbFreqLow  = max(20.0f,  min(500.0f,  lo));
-            g_bbFreqHigh = max(50.0f,  min(2000.0f, hi));
-            g_bbGainDB   = max(0.0f,   min(24.0f,   gn));
-            g_bassBoost   = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_BB_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
-            g_dspReverb   = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_REVERB),   BM_GETCHECK,0,0)==BST_CHECKED);
-            g_dspSaturate = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_SATURATE), BM_GETCHECK,0,0)==BST_CHECKED);
-            g_dspVinyl    = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_VINYL),    BM_GETCHECK,0,0)==BST_CHECKED);
-            g_dspHifi     = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_HIFI),     BM_GETCHECK,0,0)==BST_CHECKED);
-            {
-                wchar_t tb[16];
-                GetDlgItemText(s_optPanels[2], ID_OPT_REV_MIX,   tb,16); g_revMix    = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_REV_ROOM,  tb,16); g_revRoom   = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_REV_WIDTH, tb,16); g_revWidth  = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_SAT_DRIVE, tb,16); g_satDrive  = max(1.0f,  min(10.0f,   (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_SAT_LEVEL, tb,16); g_satLevel  = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_VIN_FREQ,  tb,16); g_vinLpFreq = max(500.0f,min(20000.0f,(float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_VIN_CRACK, tb,16); g_vinCrackle= max(0.0f,  min(100.0f,  (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_HFI_BASS,  tb,16); g_hfiBassDb = max(0.0f,  min(24.0f,   (float)_wtof(tb)));
-                GetDlgItemText(s_optPanels[2], ID_OPT_HFI_WARM,  tb,16); g_hfiWarmth = max(0.0f,  min(100.0f,  (float)_wtof(tb)));
-            }
             // Display page
             bool wasDark = g_darkMode;
             g_darkMode   = (SendMessage(GetDlgItem(s_optPanels[1], ID_OPT_DARKMODE),  BM_GETCHECK,0,0)==BST_CHECKED);
@@ -9642,17 +8349,12 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             { wchar_t sb[16]; GetDlgItemText(s_optPanels[0], ID_OPT_SEEK_STEP, sb, 16);
               float sv = (float)_wtof(sb); if (sv >= 1.0f) g_seekStep = sv; }
             // Remember session
-            if (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_SESSION_SEEK), BM_GETCHECK,0,0)==BST_CHECKED)
-                g_rememberSession = 2;
-            else if (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_SESSION_TRACK), BM_GETCHECK,0,0)==BST_CHECKED)
-                g_rememberSession = 1;
-            else
-                g_rememberSession = 0;
+            g_rememberSession = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_SESSION_TRACK), BM_GETCHECK,0,0)==BST_CHECKED) ? 1 : 0;
             // Microphone output
-            g_micOutEnabled = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
-            g_micOutMode = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_BOTH), BM_GETCHECK,0,0)==BST_CHECKED) ? 1 : 0;
+            g_micOutEnabled = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_MICOUT_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
+            g_micOutMode = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_MICOUT_BOTH), BM_GETCHECK,0,0)==BST_CHECKED) ? 1 : 0;
             {
-                HWND hMicC = GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_COMBO);
+                HWND hMicC = GetDlgItem(s_optPanels[2], ID_OPT_MICOUT_COMBO);
                 int msel = (int)SendMessage(hMicC, CB_GETCURSEL, 0, 0);
                 if (msel != CB_ERR) {
                     wchar_t mn[256] = L"";
@@ -9662,26 +8364,25 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                     g_micOutDeviceName[0] = L'\0';
             }
             // Device page
-            if (s_optPanels[3])
-                g_rememberVolume = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_REMEMBER_VOL), BM_GETCHECK,0,0)==BST_CHECKED);
+            if (s_optPanels[2])
+                g_rememberVolume = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_REMEMBER_VOL), BM_GETCHECK,0,0)==BST_CHECKED);
             // Recording save path
-            if (s_optPanels[3])
-                GetDlgItemText(s_optPanels[3], ID_OPT_REC_PATH, g_recSaveDir, MAX_PATH);
-            ApplyDSP();
+            if (s_optPanels[2])
+                GetDlgItemText(s_optPanels[2], ID_OPT_REC_PATH, g_recSaveDir, MAX_PATH);
             if (g_hwnd) LayoutControls(g_hwnd);
             // Timestretch page
-            if (s_optPanels[5]) {
+            if (s_optPanels[3]) {
                 bool wasPitch = g_pitchEnabled;
                 float wasAmt  = g_pitchSemitones;
-                g_pitchEnabled = (SendMessage(GetDlgItem(s_optPanels[5], ID_OPT_PITCH_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
-                wchar_t pbuf[16]; GetWindowText(GetDlgItem(s_optPanels[5], ID_OPT_PITCH_VALUE), pbuf, 16);
+                g_pitchEnabled = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_PITCH_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
+                wchar_t pbuf[16]; GetWindowText(GetDlgItem(s_optPanels[3], ID_OPT_PITCH_VALUE), pbuf, 16);
                 g_pitchSemitones = max(-12.0f, min(12.0f, (float)_wtof(pbuf)));
                 if (wasPitch != g_pitchEnabled || wasAmt != g_pitchSemitones) ApplyPitch();
             }
             if (g_darkMode != wasDark) ApplyTheme();
             // Auto-switch audio device if changed
-            if (s_optPanels[3]) {
-                HWND hCombo = GetDlgItem(s_optPanels[3], ID_OPT_DEVICE_COMBO);
+            if (s_optPanels[2]) {
+                HWND hCombo = GetDlgItem(s_optPanels[2], ID_OPT_DEVICE_COMBO);
                 int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
                 if (sel != CB_ERR) {
                     int devIdx = (int)SendMessage(hCombo, CB_GETITEMDATA, sel, 0);
@@ -9723,19 +8424,13 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 DeleteFile(g_iniPath);
                 g_iniPath[0] = L'\0';
                 LoadSettings();
-                RegisterAllSoundHotkeys(g_hwnd);
                 // Apply all effects
-                ApplyDSP();
                 ApplyPitch();
                 ApplyTheme();
                 // Repaint toggle buttons on main window
                 if (hShuffleBtn)    InvalidateRect(hShuffleBtn,    NULL, TRUE);
                 if (hRepeatBtn)     InvalidateRect(hRepeatBtn,     NULL, TRUE);
-                if (hMonoBtn)       InvalidateRect(hMonoBtn,       NULL, TRUE);
-                if (hNormalizeBtn)  InvalidateRect(hNormalizeBtn,  NULL, TRUE);
-                if (hBassBoostBtn)  InvalidateRect(hBassBoostBtn,  NULL, TRUE);
-                if (hDspBtn)        InvalidateRect(hDspBtn,        NULL, TRUE);
-                LayoutControls(g_hwnd); // update star + FX button visibility
+                LayoutControls(g_hwnd); // refresh main-window buttons
                 // Save defaults so exit doesn't overwrite with stale values
                 SaveSettings();
                 DestroyWindow(hwnd);
@@ -9751,8 +8446,8 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)wParam;
-        if (msg == WM_CTLCOLORSTATIC && s_optPanels[3] && g_micOutEnabled
-            && (HWND)lParam == GetDlgItem(s_optPanels[3], ID_OPT_MICOUT_STATUS)
+        if (msg == WM_CTLCOLORSTATIC && s_optPanels[2] && g_micOutEnabled
+            && (HWND)lParam == GetDlgItem(s_optPanels[2], ID_OPT_MICOUT_STATUS)
             && MicOutFindDevice() < 0)
             SetTextColor(dc, RGB(232, 88, 88));   // cable missing — red hint
         else
@@ -9774,14 +8469,14 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
     }
     case WM_HSCROLL: {
         // Pitch slider moved — update the value edit field
-        if (!s_optPanels[5]) break;
-        HWND hSlider = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_SLIDER);
+        if (!s_optPanels[3]) break;
+        HWND hSlider = GetDlgItem(s_optPanels[3], ID_OPT_PITCH_SLIDER);
         if ((HWND)lParam != hSlider) break;
         int pos = (int)SendMessage(hSlider, TBM_GETPOS, 0, 0);
         float semitones = pos / 10.0f;
         wchar_t buf[16]; swprintf_s(buf, L"%.1f", semitones);
         // Update edit without triggering EN_CHANGE feedback loop
-        HWND hEdit = GetDlgItem(s_optPanels[5], ID_OPT_PITCH_VALUE);
+        HWND hEdit = GetDlgItem(s_optPanels[3], ID_OPT_PITCH_VALUE);
         SetWindowText(hEdit, buf);
         break;
     }
@@ -9824,37 +8519,6 @@ void OpenOptionsDialog()
         pr.left + (pr.right - pr.left - dw) / 2,
         pr.top  + (pr.bottom - pr.top  - dh) / 2,
         dw, dh, SWP_NOZORDER);
-}
-
-void OpenConvertDialog()
-{
-    if (g_hwndConvert && IsWindow(g_hwndConvert)) { SetForegroundWindow(g_hwndConvert); return; }
-    HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(g_hwnd, GWLP_HINSTANCE);
-    static const wchar_t CONV_CLASS[] = L"BillyConvertWnd";
-    static bool convReg = false;
-    if (!convReg) {
-        WNDCLASS wc = {}; wc.lpfnWndProc = ConvertWndProc; wc.hInstance = hInst;
-        wc.lpszClassName = CONV_CLASS; wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_BILLYPRO));
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClass(&wc); convReg = true;
-    }
-    // Compute window size so the client area exactly fits the layout (client = 716 x 470)
-    // Controls: cw=700 wide, bottom of buttons at y=452, +18px bottom padding = 470 client height
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_THICKFRAME;
-    RECT cr = { 0, 0, 716, 470 };
-    AdjustWindowRect(&cr, style, FALSE);
-    int dw = cr.right  - cr.left;
-    int dh = cr.bottom - cr.top;
-
-    g_hwndConvert = CreateWindowEx(WS_EX_APPWINDOW, CONV_CLASS,
-        L"转换",
-        style, 0, 0, dw, dh, NULL, NULL, hInst, NULL);
-
-    // Centre over the main window
-    RECT pr; GetWindowRect(g_hwnd, &pr);
-    int cx = pr.left + (pr.right  - pr.left - dw) / 2;
-    int cy = pr.top  + (pr.bottom - pr.top  - dh) / 2;
-    SetWindowPos(g_hwndConvert, NULL, cx, cy, dw, dh, SWP_NOZORDER);
 }
 
 // ============================================================
@@ -10870,15 +9534,6 @@ void LayoutControls(HWND hwnd)
     int sbx = m + 5 * (bw + bs) + bw + 6;
     MoveWindow(hShuffleBtn, sbx, y, 46, bh, TRUE);
     MoveWindow(hRepeatBtn, sbx + 50, y, 46, bh, TRUE);
-    MoveWindow(hMonoBtn, sbx + 100, y, 36, bh, TRUE);
-    MoveWindow(hNormalizeBtn, sbx + 140, y, 36, bh, TRUE);
-    MoveWindow(hBassBoostBtn, sbx + 180, y, 58, bh, TRUE);
-    // FX (DSP) button: right of BassBoost, visible only when any extra effect is enabled
-    if (hDspBtn) {
-        bool showDsp = g_dspReverb || g_dspSaturate || g_dspVinyl || g_dspHifi;
-        MoveWindow(hDspBtn, sbx + 242, y, 30, bh, TRUE);
-        ShowWindow(hDspBtn, showDsp ? SW_SHOW : SW_HIDE);
-    }
     // Row 2: seek bar
     int vw = 12;  // vol bar width
 
@@ -11217,10 +9872,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         hNextBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, hInst, NULL);
         hShuffleBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_SHUFFLE, hInst, NULL);
         hRepeatBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_REPEAT, hInst, NULL);
-        hMonoBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MONO, hInst, NULL);
-        hNormalizeBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NORMALIZE, hInst, NULL);
-        hBassBoostBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_BASSBOOST, hInst, NULL);
-        hDspBtn       = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_DSP,       hInst, NULL);
         hRecordBtn    = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_RECORD,    hInst, NULL);
         hMediaBtn     = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MEDIA,     hInst, NULL);
         hBackBtn      = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_BACK,      hInst, NULL);
@@ -11267,10 +9918,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetWindowLongPtr(hNextBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hShuffleBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hRepeatBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hMonoBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hNormalizeBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hBassBoostBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hDspBtn,       GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hRecordBtn,    GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hBackBtn,      GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
 
@@ -11323,8 +9970,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         RegisterHotKey(hwnd, ID_HOTKEY_NEXT,      0, VK_MEDIA_NEXT_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_PREV,      0, VK_MEDIA_PREV_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_STOP,      0, VK_MEDIA_STOP);
-        // Register per-sound global hotkeys (soundboard)
-        RegisterAllSoundHotkeys(hwnd);
+        // Low-level keyboard hook: global sound/fn hotkeys fire even under IME
+        InstallKeyboardHook();
 
         // Resolve the mic-output (virtual cable) device at startup
         MicOutStartupResolve();
@@ -11610,12 +10257,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_BTN_STOP:      DrawBtn(dis, BTN_STOP);    return TRUE;
         case ID_BTN_NEXT:      DrawBtn(dis, BTN_NEXT);    return TRUE;
         case ID_BTN_SHUFFLE:    DrawBtn(dis, BTN_SHUFFLE);    return TRUE;
-        case ID_BTN_MONO:       DrawBtn(dis, BTN_MONO);       return TRUE;
-        case ID_BTN_NORMALIZE: DrawBtn(dis, BTN_NORMALIZE); return TRUE;
-        case ID_BTN_BASSBOOST:  DrawBtn(dis, BTN_BASSBOOST);  return TRUE;
         case ID_BTN_REPEAT:     DrawBtn(dis, BTN_REPEAT);     return TRUE;
         case ID_BTN_MEDIA:      DrawBtn(dis, BTN_MEDIA);      return TRUE;
-        case ID_BTN_DSP:        DrawBtn(dis, BTN_DSP);        return TRUE;
         case ID_BTN_RECORD:    DrawBtn(dis, BTN_RECORD);    return TRUE;
         case ID_BTN_BACK:       DrawBtn(dis, BTN_BACK);       return TRUE;
         }
@@ -11757,6 +10400,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         default:
             if ((int)wParam >= ID_HOTKEY_SND_BASE && (int)wParam < ID_HOTKEY_SND_BASE + SNDHK_MAX)
                 TriggerSoundHotkey((int)wParam - ID_HOTKEY_SND_BASE);
+            else if ((int)wParam >= ID_HOTKEY_FN_BASE && (int)wParam < ID_HOTKEY_FN_BASE + FNHK_COUNT)
+                TriggerFnHotkey((int)wParam - ID_HOTKEY_FN_BASE);
             break;
         }
         UpdateThumbButtons();
@@ -11947,7 +10592,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             bool childActive = (g_hwndSearch && IsWindow(g_hwndSearch)) ||
                                (g_hwndInfo && IsWindow(g_hwndInfo)) ||
                                (g_hwndOptions && IsWindow(g_hwndOptions)) ||
-                               (g_hwndConvert && IsWindow(g_hwndConvert)) ||
                                (g_hwndDiscogs && IsWindow(g_hwndDiscogs)) ||
                                (g_hwndRadio && IsWindow(g_hwndRadio));
             if (!childActive) SetFocus(hListBox);
@@ -12018,17 +10662,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
         }
-        case ID_BTN_MONO:
-            g_mono = !g_mono; ApplyDSP(); InvalidateRect(hMonoBtn, NULL, TRUE); break;
-        case ID_BTN_NORMALIZE:
-            g_normalize = !g_normalize; ApplyDSP(); InvalidateRect(hNormalizeBtn, NULL, TRUE); break;
-        case ID_BTN_BASSBOOST:
-            g_bassBoost = !g_bassBoost; ApplyDSP(); InvalidateRect(hBassBoostBtn, NULL, TRUE); break;
-        case ID_BTN_DSP:
-            g_dspBypass = !g_dspBypass;
-            ApplyDSP();
-            if (hDspBtn) InvalidateRect(hDspBtn, NULL, TRUE);
-            break;
         case ID_BTN_RECORD:
             if (g_recording) StopRecording();
             else StartRecording();
@@ -12085,7 +10718,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
         case IDC_CTX_HOTKEY:
-            if (!g_ctxIsBrowser && g_ctxFilePath[0]) OpenHotkeyBindDialog(g_ctxFilePath);
+            if (!g_ctxIsBrowser && g_ctxFilePath[0]) OpenHotkeyBindDialog(g_ctxFilePath, -1);
             break;
         case IDC_CTX_REMOVE: {
             // Collect all selected items
@@ -12183,10 +10816,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             DestroyWindow(hwnd);
             break;
         case IDM_FILE_EXIT:      RemoveTrayIcon(); DestroyWindow(hwnd); break;
-        case IDM_FILE_CONVERT:   OpenConvertDialog(); break;
-        case IDM_FILE_OPENM3U:   LoadPlaylistM3U(hwnd); break;
-        case IDM_FILE_SAVEM3U:   SavePlaylistM3U(hwnd); break;
-
         case IDM_VIEW_DARKMODE:
             g_darkMode = !g_darkMode;
             ApplyTheme();
@@ -12216,89 +10845,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             CheckMenuItem(GetMenu(hwnd), IDM_PLAY_REPEAT, g_repeatMode ? MF_CHECKED : MF_UNCHECKED);
             InvalidateRect(hRepeatBtn, NULL, TRUE); PreloadNext(); break;
 
-        case IDM_HELP_UPDATE: {
-            // Fetch latest release tag from GitHub API with 5s timeout
-            wchar_t latestVer[64] = L"";
-            bool ok = false;
-            HINTERNET hSess = WinHttpOpen(L"BillyPro/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-            if (hSess) {
-                WinHttpSetTimeouts(hSess, 5000, 5000, 5000, 5000);
-                HINTERNET hConn = WinHttpConnect(hSess, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
-                if (hConn) {
-                    HINTERNET hReq = WinHttpOpenRequest(hConn, L"GET",
-                        L"/repos/bisoloc/BillyPro/releases/latest",
-                        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-                    if (hReq) {
-                        if (WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) &&
-                            WinHttpReceiveResponse(hReq, NULL)) {
-                            char buf[4096] = {};
-                            DWORD read = 0;
-                            WinHttpReadData(hReq, buf, sizeof(buf) - 1, &read);
-                            buf[read] = 0;
-                            // Parse "tag_name":"vX.Y" or "tag_name":"X.Y"
-                            const char* tag = strstr(buf, "\"tag_name\"");
-                            if (tag) {
-                                const char* q1 = strchr(tag + 10, '"');
-                                if (q1) {
-                                    q1++;
-                                    if (*q1 == 'v' || *q1 == 'V') q1++;
-                                    const char* q2 = strchr(q1, '"');
-                                    if (q2 && q2 - q1 < 60) {
-                                        MultiByteToWideChar(CP_UTF8, 0, q1, (int)(q2 - q1), latestVer, 63);
-                                        ok = true;
-                                    }
-                                }
-                            }
-                        }
-                        WinHttpCloseHandle(hReq);
-                    }
-                    WinHttpCloseHandle(hConn);
-                }
-                WinHttpCloseHandle(hSess);
-            }
-            wchar_t msg[512];
-            if (!ok) {
-                swprintf_s(msg, L"当前版本: V%s\n\n无法连接 GitHub，请检查网络连接。", APP_VERSION);
-                MessageBox(hwnd, msg, L"检查更新", MB_ICONWARNING);
-            } else if (_wcsicmp(latestVer, APP_VERSION) == 0) {
-                swprintf_s(msg, L"当前版本: V%s\n\n已是最新版本。", APP_VERSION);
-                MessageBox(hwnd, msg, L"检查更新", MB_ICONINFORMATION);
-            } else {
-                swprintf_s(msg, L"当前版本: V%s\n最新版本: V%s\n\n要打开下载页面吗？", APP_VERSION, latestVer);
-                if (MessageBox(hwnd, msg, L"发现新版本", MB_YESNO | MB_ICONINFORMATION) == IDYES)
-                    ShellExecute(hwnd, L"open", L"https://github.com/bisoloc/BillyPro/releases", NULL, NULL, SW_SHOW);
-            }
-            break;
-        }
-        case IDM_HELP_ABOUT:
-            MessageBox(hwnd,
-                L"BillyPro V0.9\n\n"
-                L"轻量级音乐播放器\n\n"
-                L"作者：MRJN/CLD。",
-                L"关于 BillyPro", MB_ICONINFORMATION);
-            break;
-        case IDM_HELP_CONTROLS:
-            MessageBox(hwnd,
-                L"键盘控制:\n\n"
-                L"  Space          播放 / 暂停\n"
-                L"  ←/→            快退/快进 3 秒（按住可连续快进）\n"
-                L"  ↑/↓            音量 +/- 5%%\n"
-                L"  滚轮            调节音量\n"
-                L"  N/P            下一首 / 上一首\n"
-                L"  F/Ctrl+F       搜索播放列表\n"
-                L"  S              随机播放开/关\n"
-                L"  R              切换循环模式\n"
-                L"  Delete         移除所选曲目\n"
-                L"  Ctrl+A         全选曲目\n"
-                L"  Ctrl+↑/↓       调节音量\n"
-                L"  Enter          播放所选\n\n"
-                L"鼠标:\n"
-                L"  双击            播放曲目\n"
-                L"  右键            上下文菜单\n"
-                L"  拖放            载入文件夹 / 文件",
-                L"控制说明", MB_ICONINFORMATION);
-            break;
         case IDM_OPTIONS:
         {
             OpenOptionsDialog();
@@ -12411,7 +10957,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_masterFreq  = ci.freq;
                 g_masterChans = ci.chans;
                 if (currentStream) {
-                    ApplyDSP();
                     ApplyPitch();
                     UpdateVolume();
                     MicOutMaybeAttachTap();
@@ -12487,7 +11032,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         KillTimer(g_hwnd, IDT_SEEK_REPEAT);
         if (g_hwndSearch && IsWindow(g_hwndSearch))   DestroyWindow(g_hwndSearch);
         if (g_hwndInfo && IsWindow(g_hwndInfo))        DestroyWindow(g_hwndInfo);
-        if (g_hwndConvert && IsWindow(g_hwndConvert))  DestroyWindow(g_hwndConvert);
         if (g_hwndAssoc && IsWindow(g_hwndAssoc))      DestroyWindow(g_hwndAssoc);
         FreeArtBytes();
         DragAcceptFiles(hwnd, FALSE);
@@ -12501,8 +11045,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         UnregisterHotKey(hwnd, ID_HOTKEY_NEXT);
         UnregisterHotKey(hwnd, ID_HOTKEY_PREV);
         UnregisterHotKey(hwnd, ID_HOTKEY_STOP);
-        // Unregister soundboard hotkey slots
-        for (int i = 0; i < SNDHK_MAX; i++) UnregisterHotKey(hwnd, ID_HOTKEY_SND_BASE + i);
+        // Uninstall the keyboard hook (global sound/fn hotkeys)
+        ShutdownKeyboardHook();
         // Release SMTC
         SmtcCleanup();
         // Release taskbar thumbnail
@@ -12624,15 +11168,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
 
     HMENU hMenu = CreateMenu();
     HMENU hFile = CreatePopupMenu(), hPlay = CreatePopupMenu();
-    HMENU hHelp = CreatePopupMenu(), hOpts = CreatePopupMenu();
+    HMENU hOpts = CreatePopupMenu();
     HMENU hView = CreatePopupMenu();
 
     AppendMenu(hFile, MF_STRING, IDM_FILE_OPENFOLDER, L"打开文件夹...\tCtrl+O");
-    AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hFile, MF_STRING, IDM_FILE_OPENM3U,   L"加载播放列表 (M3U)...");
-    AppendMenu(hFile, MF_STRING, IDM_FILE_SAVEM3U,   L"保存播放列表 (M3U)...");
-    AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hFile, MF_STRING, IDM_FILE_CONVERT,   L"转换...");
     AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
     AppendMenu(hFile, MF_STRING, IDM_FILE_EXIT,      L"退出");
 
@@ -12650,11 +11189,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     AppendMenu(hView, MF_STRING, IDM_VIEW_COLUMNS,  L"列视图");
 
     AppendMenu(hOpts, MF_STRING, IDM_OPTIONS, L"选项...");
-
-    AppendMenu(hHelp, MF_STRING, IDM_HELP_ABOUT,    L"关于...");
-    AppendMenu(hHelp, MF_STRING, IDM_HELP_CONTROLS, L"控制说明...");
-    AppendMenu(hHelp, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hHelp, MF_STRING, IDM_HELP_UPDATE,  L"检查更新...");
 
     // Library menu (Favorites + cascading Playlists submenu)
     HMENU hLib = CreatePopupMenu();
@@ -12677,7 +11211,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hView, L"查看(&V)");
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hLib,  L"资料库(&L)");
     AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hOpts, L"选项(&O)");
-    AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hHelp, L"帮助(&H)");
     SetMenu(hwnd, hMenu);
 
     // Now that the menu exists, apply persisted checkmarks
@@ -12778,8 +11311,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             if (GetKeyState(VK_SHIFT)   & 0x8000) lmod |= MOD_SHIFT;
             if ((((USHORT)GetKeyState(VK_LWIN)) | ((USHORT)GetKeyState(VK_RWIN))) & 0x8000) lmod |= MOD_WIN;
             if (!(msg.lParam & (1 << 30))) {          // ignore auto-repeat
-                int slot = MatchLocalSoundHotkey((UINT)msg.wParam, lmod);
+                // Under an IME the keydown arrives as VK_PROCESSKEY — recover the real key
+                UINT lvk = (UINT)msg.wParam;
+                if (lvk == VK_PROCESSKEY) {
+                    HWND kfw = GetFocus();
+                    if (kfw) lvk = (UINT)ImmGetVirtualKey(kfw);
+                }
+                int slot = MatchLocalSoundHotkey(lvk, lmod);
                 if (slot >= 0) { TriggerSoundHotkey(slot); continue; }
+                slot = MatchLocalFnHotkey(lvk, lmod);
+                if (slot >= 0) { TriggerFnHotkey(slot); continue; }
             }
         }
         if (msg.message == WM_KEYDOWN) {
@@ -12790,7 +11331,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             bool dialogFocused =
                 (g_hwndInfo    && IsWindow(g_hwndInfo)    && (focusWnd == g_hwndInfo    || IsChild(g_hwndInfo,    focusWnd))) ||
                 (g_hwndOptions && IsWindow(g_hwndOptions) && (focusWnd == g_hwndOptions || IsChild(g_hwndOptions, focusWnd))) ||
-                (g_hwndConvert && IsWindow(g_hwndConvert) && (focusWnd == g_hwndConvert || IsChild(g_hwndConvert, focusWnd))) ||
                 (g_hwndDiscogs && IsWindow(g_hwndDiscogs) && (focusWnd == g_hwndDiscogs || IsChild(g_hwndDiscogs, focusWnd))) ||
                 (g_hwndRadio   && IsWindow(g_hwndRadio)   && (focusWnd == g_hwndRadio   || IsChild(g_hwndRadio,   focusWnd)));
             if (!searchFocused && !dialogFocused) {
@@ -12866,7 +11406,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
         }
         if (g_hwndInfo    && IsWindow(g_hwndInfo)    && IsDialogMessage(g_hwndInfo,    &msg)) continue;
         if (g_hwndOptions && IsWindow(g_hwndOptions) && IsDialogMessage(g_hwndOptions, &msg)) continue;
-        if (g_hwndConvert && IsWindow(g_hwndConvert) && IsDialogMessage(g_hwndConvert, &msg)) continue;
         if (g_hwndDiscogs && IsWindow(g_hwndDiscogs) && IsDialogMessage(g_hwndDiscogs, &msg)) continue;
         if (g_hwndRadio   && IsWindow(g_hwndRadio)   && IsDialogMessage(g_hwndRadio,   &msg)) continue;
         TranslateMessage(&msg);
