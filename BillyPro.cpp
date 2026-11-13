@@ -78,7 +78,6 @@ extern "C" {
 #define ID_BTN_SHUFFLE      121
 #define ID_BTN_REPEAT       122
 #define ID_BTN_MEDIA        126
-#define ID_BTN_RECORD       129
 #define ID_BTN_BACK         128
 #define IDM_OPTIONS         2401
 #define IDM_OPTIONS_SHOW    2402
@@ -274,9 +273,6 @@ std::vector<std::wstring> g_mediaFolders; // all configured media root folders
 bool    g_mediaActive = false;
 bool    g_pitchEnabled = false;
 float   g_pitchSemitones = 0.0f;  // -12 to +12 semitones (CDJ-style: changes pitch + tempo)
-// Recording
-wchar_t g_recOutDir[MAX_PATH] = L"";
-// Extra DSP effects
 HWND  hBackBtn      = NULL;
 
 // Gapless playback: decode streams fed into a master output via STREAMPROC
@@ -363,14 +359,6 @@ bool   g_trayAdded    = false;   // system tray icon active
 bool   g_darkMode     = false;   // dark theme enabled
 bool   g_modernStyle  = false;  // modern style: artwork thumbnails in playlist
 int    g_modernSize   = 0;      // 0=small(32), 1=medium(48), 2=large(64)
-// Recording state
-static bool    g_recording = false;
-static HDSP    g_recDsp = 0;
-static wchar_t g_recPath[MAX_PATH] = L"";
-static wchar_t g_recSaveDir[MAX_PATH] = L"";  // default recording save directory
-static volatile ULONGLONG g_recBytesIn = 0;    // PCM bytes fed to encoder (for size estimate)
-static HWND    hRecordBtn = NULL;
-
 // Internet Radio state (used by StopAudio/UpdateStatusBar before radio code is defined)
 static bool g_radioPlaying = false;
 static HSTREAM g_radioStream = 0;
@@ -409,7 +397,6 @@ void StopAudio();
 // libFLAC decoder struct + globals (implementation after DTS section)
 #include <FLAC/stream_decoder.h>
 #include <FLAC/metadata.h>
-#include <FLAC/stream_encoder.h>
 struct FlacDecoder {
     FLAC__StreamDecoder* dec;
     int      sampleRate;
@@ -790,131 +777,6 @@ void LoadFolder(const wchar_t* folder)
     UpdateStatusBar();
 }
 
-// --- Recording: real-time FLAC encoding via libFLAC stream encoder ---
-static FLAC__StreamEncoder* g_recEncoder = NULL;
-// Pre-allocated conversion buffer — avoids heap allocation on every DSP callback
-static FLAC__int32* g_recPcmBuf = NULL;
-static DWORD        g_recPcmCap = 0;  // capacity in FLAC__int32 elements
-
-void CALLBACK DSP_Record(HDSP handle, DWORD channel, void* buffer, DWORD length, void* user)
-{
-    if (!g_recording || !g_recEncoder || length == 0) return;
-    float* buf = (float*)buffer;
-    DWORD floats = length / sizeof(float);
-    BASS_CHANNELINFO ci = {};
-    BASS_ChannelGetInfo(channel, &ci);
-    int nch = ci.chans > 0 ? ci.chans : 2;
-    DWORD frames = floats / nch;
-    // Grow pre-allocated buffer if needed (rare — typically once on first callback)
-    if (floats > g_recPcmCap) {
-        free(g_recPcmBuf);
-        g_recPcmCap = floats + 1024;  // slight over-alloc to avoid repeated resizes
-        g_recPcmBuf = (FLAC__int32*)malloc(g_recPcmCap * sizeof(FLAC__int32));
-        if (!g_recPcmBuf) { g_recPcmCap = 0; return; }
-    }
-    // Convert float [-1,1] to 32-bit int for FLAC (using 16-bit depth, stored in int32)
-    for (DWORD i = 0; i < floats; i++) {
-        float s = buf[i];
-        if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
-        g_recPcmBuf[i] = (FLAC__int32)(s * 32767.0f);
-    }
-    FLAC__stream_encoder_process_interleaved(g_recEncoder, g_recPcmBuf, frames);
-    g_recBytesIn += (ULONGLONG)frames * nch * 2;
-}
-
-static void StartRecording()
-{
-    if (g_recording || !currentStream) return;
-
-    // Build filename: name_YYYYMMDD_HHMMSS.flac
-    SYSTEMTIME st; GetLocalTime(&st);
-    wchar_t nameBase[256] = L"录音";
-    if (g_radioPlaying && g_radioStationName[0])
-        wcsncpy_s(nameBase, g_radioStationName, _TRUNCATE);
-    else if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size()) {
-        wcsncpy_s(nameBase, g_playlist[g_currentIndex].display, _TRUNCATE);
-        wchar_t* dot = wcsrchr(nameBase, L'.'); if (dot) *dot = 0;
-    }
-    // Sanitize
-    for (wchar_t* p = nameBase; *p; p++)
-        if (*p==L'\\'||*p==L'/'||*p==L':'||*p==L'*'||*p==L'?'||*p==L'"'||*p==L'<'||*p==L'>'||*p==L'|') *p=L'_';
-
-    wchar_t fileName[MAX_PATH];
-    _snwprintf_s(fileName, MAX_PATH, _TRUNCATE, L"%s_%04d%02d%02d_%02d%02d%02d.flac",
-        nameBase, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-
-    wchar_t savePath[MAX_PATH];
-    if (g_recSaveDir[0] && GetFileAttributesW(g_recSaveDir) != INVALID_FILE_ATTRIBUTES) {
-        // Default save dir is set — auto-save there, no dialog
-        _snwprintf_s(savePath, MAX_PATH, _TRUNCATE, L"%s\\%s", g_recSaveDir, fileName);
-    } else {
-        // No default dir — ask user once, then remember the folder
-        wcsncpy_s(savePath, fileName, _TRUNCATE);
-        OPENFILENAME ofn = { sizeof(ofn) };
-        ofn.hwndOwner = g_hwnd; ofn.lpstrFile = savePath; ofn.nMaxFile = MAX_PATH;
-        ofn.lpstrFilter = L"FLAC 音频\0*.flac\0所有文件\0*.*\0";
-        ofn.lpstrDefExt = L"flac"; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        if (!GetSaveFileName(&ofn)) return;
-        // Remember the chosen directory for next time
-        wcsncpy_s(g_recSaveDir, savePath, _TRUNCATE);
-        wchar_t* lastSep = wcsrchr(g_recSaveDir, L'\\');
-        if (lastSep) *lastSep = L'\0';
-        SaveSettings();
-    }
-
-    BASS_CHANNELINFO ci = {};
-    BASS_ChannelGetInfo(currentStream, &ci);
-    int nch = ci.chans > 0 ? ci.chans : 2;
-    int sr = ci.freq > 0 ? ci.freq : 44100;
-
-    // Create FLAC encoder
-    g_recEncoder = FLAC__stream_encoder_new();
-    if (!g_recEncoder) { MessageBox(g_hwnd, L"创建 FLAC 编码器失败。", L"录音", MB_ICONERROR); return; }
-    FLAC__stream_encoder_set_channels(g_recEncoder, nch);
-    FLAC__stream_encoder_set_bits_per_sample(g_recEncoder, 16);
-    FLAC__stream_encoder_set_sample_rate(g_recEncoder, sr);
-    FLAC__stream_encoder_set_compression_level(g_recEncoder, 5);
-
-    // Convert path to UTF-8 for libFLAC
-    int uLen = WideCharToMultiByte(CP_UTF8, 0, savePath, -1, NULL, 0, NULL, NULL);
-    std::vector<char> u8buf(uLen > 0 ? uLen : 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, savePath, -1, u8buf.data(), uLen, NULL, NULL);
-
-    FLAC__StreamEncoderInitStatus initStatus = FLAC__stream_encoder_init_file(
-        g_recEncoder, u8buf.data(), NULL, NULL);
-    if (initStatus != FLAC__STREAM_ENCODER_INIT_STATUS_OK) {
-        FLAC__stream_encoder_delete(g_recEncoder); g_recEncoder = NULL;
-        MessageBox(g_hwnd, L"初始化 FLAC 编码器失败。", L"录音", MB_ICONERROR);
-        return;
-    }
-
-    wcsncpy_s(g_recPath, savePath, _TRUNCATE);
-    g_recBytesIn = 0;
-    g_recDsp = BASS_ChannelSetDSP(currentStream, DSP_Record, NULL, 10);
-    g_recording = true;
-    if (hRecordBtn) InvalidateRect(hRecordBtn, NULL, TRUE);
-    // Trigger re-layout so remaining-time label gets wider for rec size display
-    if (g_hwnd) { RECT wr; GetClientRect(g_hwnd, &wr); SendMessage(g_hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(wr.right, wr.bottom)); }
-}
-
-static void StopRecording()
-{
-    if (!g_recording) return;
-    g_recording = false;  // stop DSP callback from writing more data
-    if (g_recDsp && currentStream) { BASS_ChannelRemoveDSP(currentStream, g_recDsp); g_recDsp = 0; }
-    if (g_recEncoder) {
-        // finish() seeks back and updates STREAMINFO with total_samples, making file seekable
-        FLAC__stream_encoder_finish(g_recEncoder);
-        FLAC__stream_encoder_delete(g_recEncoder);
-        g_recEncoder = NULL;
-    }
-    // Free pre-allocated conversion buffer
-    if (g_recPcmBuf) { free(g_recPcmBuf); g_recPcmBuf = NULL; g_recPcmCap = 0; }
-    if (hRecordBtn) InvalidateRect(hRecordBtn, NULL, TRUE);
-    if (hTimeRemain) SetWindowText(hTimeRemain, L"");
-    // Restore normal label width
-    if (g_hwnd) { RECT wr; GetClientRect(g_hwnd, &wr); SendMessage(g_hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(wr.right, wr.bottom)); }
-}
 
 // ============================================================
 //  INI settings
@@ -2039,9 +1901,6 @@ void SaveSettings()
 {
     GetIniPath();
     wchar_t buf[64];
-    // Recording output dir
-    WritePrivateProfileString(L"Paths", L"RecordOutDir", g_recOutDir, g_iniPath);
-    WritePrivateProfileString(L"Paths", L"RecordSaveDir", g_recSaveDir, g_iniPath);
     WritePrivateProfileString(L"Discogs", L"Token", g_discogsToken, g_iniPath);
     // UI prefs
     swprintf_s(buf, L"%d", (int)g_darkMode);   WritePrivateProfileString(L"UI", L"DarkMode",      buf, g_iniPath);
@@ -2102,8 +1961,6 @@ void LoadSettings()
     wchar_t buf[64];
 #define GETI(sec,key,def) (int)GetPrivateProfileInt(sec, key, def, g_iniPath)
 #define GETF(sec,key,def) ([&]{ GetPrivateProfileString(sec,key,L#def,buf,64,g_iniPath); return (float)_wtof(buf); }())
-    GetPrivateProfileString(L"Paths", L"RecordOutDir", L"", g_recOutDir, MAX_PATH, g_iniPath);
-    GetPrivateProfileString(L"Paths", L"RecordSaveDir", L"", g_recSaveDir, MAX_PATH, g_iniPath);
     GetPrivateProfileString(L"Discogs", L"Token", L"", g_discogsToken, _countof(g_discogsToken), g_iniPath);
     g_darkMode   = GETI(L"UI", L"DarkMode",      0) != 0;
     g_modernStyle= GETI(L"UI", L"ModernStyle",   0) != 0;
@@ -2377,10 +2234,6 @@ void ApplyPitch()
 }
 
 // ============================================================
-//  Recording
-// ============================================================
-
-// ============================================================
 //  Audio
 // ============================================================
 void AddFolder(const wchar_t* folder)
@@ -2406,8 +2259,6 @@ void StopAudio()
     KillTimer(g_hwnd, IDT_PEAK_METER);
     KillTimer(g_hwnd, IDT_RADIO_META);
     g_seekKeyHeld = false;
-    // Stop recording if active
-    if (g_recording) StopRecording();
     MicOutStopTap();  // detach the mic-output tap before the master stream is freed
     // Clean up radio state
     if (g_radioPlaying) {
@@ -2633,38 +2484,17 @@ static double GetPlayPos()
 void UpdateTimeDisplays()
 {
     if (!currentStream) return;
-    // Show recording file size when recording
-    if (g_recording) {
-        // Estimate FLAC size from PCM bytes fed (~60% compression)
-        ULONGLONG sz = (ULONGLONG)(g_recBytesIn * 0.6);
-        // Try actual file size if available
-        if (g_recPath[0]) {
-            WIN32_FILE_ATTRIBUTE_DATA fa = {};
-            if (GetFileAttributesEx(g_recPath, GetFileExInfoStandard, &fa)) {
-                ULONGLONG diskSz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-                if (diskSz > 0) sz = diskSz;
-            }
-        }
-        wchar_t szBuf[32];
-        if (sz > 1024ULL * 1024 * 1024)
-            swprintf_s(szBuf, L"\u23FA %.1f GB", sz / (1024.0 * 1024.0 * 1024.0));
-        else if (sz > 1024ULL * 1024)
-            swprintf_s(szBuf, L"\u23FA %.1f MB", sz / (1024.0 * 1024.0));
-        else
-            swprintf_s(szBuf, L"\u23FA %.0f KB", max(1.0, sz / 1024.0));
-        if (hTimeRemain) SetWindowText(hTimeRemain, szBuf);
-    }
     if (g_radioPlaying) {
         // Radio: no meaningful time/remaining
         if (hTimeCur) SetWindowText(hTimeCur, L"直播");
         if (hTimeTot) SetWindowText(hTimeTot, L"");
-        if (!g_recording && hTimeRemain) SetWindowText(hTimeRemain, L"");
+        if (hTimeRemain) SetWindowText(hTimeRemain, L"");
         return;
     }
     double pos = GetPlayPos(), len = GetTrackLength(), rem = len - pos;
     wchar_t buf[32];
     if (hTimeCur) { FormatTime(pos, buf, _countof(buf)); SetWindowText(hTimeCur, buf); }
-    if (!g_recording && hTimeRemain && rem >= 0) {
+    if (hTimeRemain && rem >= 0) {
         wchar_t r[32]; FormatTime(rem, r, _countof(r));
         swprintf_s(buf, L"-%s", r); SetWindowText(hTimeRemain, buf);
     }
@@ -3898,7 +3728,7 @@ static void VBar(HDC dc, int cx, int cy, int h2, COLORREF c)
     HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br);
 }
 
-enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MEDIA, BTN_BACK, BTN_RECORD };
+enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MEDIA, BTN_BACK };
 
 static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
 {
@@ -3907,7 +3737,6 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
     bool toggled = (type == BTN_SHUFFLE && g_shuffle)
         || (type == BTN_REPEAT && g_repeatMode != 0)
         || (type == BTN_MEDIA && g_mediaActive)
-        || (type == BTN_RECORD && g_recording)
         ;
 
     // No border - Billy style. Hover = light blue tint, pressed = slightly darker.
@@ -3965,26 +3794,6 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &bar, b); DeleteObject(b);
         break;
     }
-    case BTN_RECORD: {
-        // Record circle — hover highlight matches transport buttons (blue tint)
-        bool recHover = (g_hoveredBtn == dis->hwndItem);
-        COLORREF recFace = toggled ? g_theme.accent
-            : pressed ? 0xC8DCF4
-            : recHover ? 0xF0D2B4
-            : g_theme.bg;
-        HBRUSH recBg = CreateSolidBrush(recFace); FillRect(dc, &rc, recBg); DeleteObject(recBg);
-        COLORREF circCol = g_recording ? 0x0000FF
-            : (recHover || pressed) ? 0x1A1A1A
-            : (g_darkMode ? 0x909090 : 0x1A1A1A);
-        HBRUSH rb = CreateSolidBrush(circCol);
-        HPEN rp = CreatePen(PS_SOLID, 1, circCol);
-        HBRUSH orb = (HBRUSH)SelectObject(dc, rb);
-        HPEN orp = (HPEN)SelectObject(dc, rp);
-        Ellipse(dc, cx - 4, cy - 4, cx + 5, cy + 5);
-        SelectObject(dc, orb); SelectObject(dc, orp);
-        DeleteObject(rb); DeleteObject(rp);
-        break;
-    }
     case BTN_SHUFFLE:
     case BTN_REPEAT:
     case BTN_MEDIA:
@@ -4007,7 +3816,6 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         case BTN_REPEAT:     lbl = (g_repeatMode == 1) ? L"单曲" : (g_repeatMode == 2) ? L"列表" : (g_repeatMode == 3) ? L"一次" : L"循环"; break;
         case BTN_MEDIA:      lbl = L"资料库"; break;
         case BTN_BACK:       lbl = L"\u2190";  break;  // ←
-        // BTN_RECORD handled above as transport button (no border)
         default:             lbl = L"";        break;
         }
         DrawText(dc, lbl, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -7864,8 +7672,6 @@ static void SmtcCleanup()
 #define ID_OPT_PITCH_SLIDER  636
 #define ID_OPT_SEEK_STEP     637
 #define ID_OPT_MODERN_SIZE   639
-#define ID_OPT_REC_PATH      653
-#define ID_OPT_REC_BROWSE    654
 #define ID_OPT_SESSION_OFF    655
 #define ID_OPT_SESSION_TRACK  656
 #define ID_OPT_DROP_LOADDIR   658
@@ -8172,26 +7978,19 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 HIBYTE(HIWORD(bassVer)), LOBYTE(HIWORD(bassVer)), HIBYTE(LOWORD(bassVer)));
             lbl(p, 10, 144, w - 20, 16, detail);
 
-            // Recording settings
-            grp(p, 0, 170, w, 96, L"录音");
-            lbl(p, 10, 192, 70, 16, L"保存路径:");
-            edt(p, 82, 190, w - 126, 22, ID_OPT_REC_PATH, g_recSaveDir);
-            btn(p, w - 40, 190, 36, 22, ID_OPT_REC_BROWSE, L"...");
-            lbl(p, 10, 218, w - 20, 32, L"录制为 FLAC（无损）。\r\n留空则每次询问。");
-
             // Microphone output (soundboard → virtual cable)
-            grp(p, 0, 276, w, 196, L"麦克风输出（虚拟声卡）");
-            chk(p, 10, 294, w - 20, 20, ID_OPT_MICOUT_ENABLE, L"启用麦克风输出（把声音送入虚拟声卡）", g_micOutEnabled);
-            { HWND h = rad(p, 10, 318, w - 20, 20, ID_OPT_MICOUT_ONLY,
+            grp(p, 0, 170, w, 196, L"麦克风输出（虚拟声卡）");
+            chk(p, 10, 188, w - 20, 20, ID_OPT_MICOUT_ENABLE, L"启用麦克风输出（把声音送入虚拟声卡）", g_micOutEnabled);
+            { HWND h = rad(p, 10, 212, w - 20, 20, ID_OPT_MICOUT_ONLY,
                 L"仅输出到虚拟声卡（本机扬声器静音）", g_micOutMode == 0);
               SetWindowLongPtr(h, GWL_STYLE, GetWindowLongPtr(h, GWL_STYLE) | WS_GROUP); }
-            rad(p, 10, 338, w - 20, 20, ID_OPT_MICOUT_BOTH,
+            rad(p, 10, 232, w - 20, 20, ID_OPT_MICOUT_BOTH,
                 L"扬声器和虚拟声卡同时输出", g_micOutMode == 1);
-            lbl(p, 10, 366, 76, 16, L"输出设备:");
+            lbl(p, 10, 260, 76, 16, L"输出设备:");
             {
                 HWND hMicCombo = CreateWindow(L"COMBOBOX", L"",
                     WS_CHILD|WS_VISIBLE|WS_TABSTOP|CBS_DROPDOWNLIST|CBS_HASSTRINGS,
-                    88, 362, w - 98, 200, p, (HMENU)ID_OPT_MICOUT_COMBO, hInst, NULL);
+                    88, 256, w - 98, 200, p, (HMENU)ID_OPT_MICOUT_COMBO, hInst, NULL);
                 SendMessage(hMicCombo, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
                 BASS_DEVICEINFO mdi; int msel = -1, mcnt = 0;
                 for (int d = 1; BASS_GetDeviceInfo(d, &mdi); d++) {
@@ -8220,10 +8019,10 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 } else
                     swprintf_s(mstat, L"⚠ 未检测到虚拟声卡（VB-CABLE）");
                 HWND hMicStat = CreateWindow(L"STATIC", mstat, WS_CHILD|WS_VISIBLE|SS_LEFT,
-                    10, 390, w - 20, 18, p, (HMENU)ID_OPT_MICOUT_STATUS, hInst, NULL);
+                    10, 284, w - 20, 18, p, (HMENU)ID_OPT_MICOUT_STATUS, hInst, NULL);
                 SendMessage(hMicStat, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
             }
-            lbl(p, 10, 414, w - 16, 36, L"语音软件里把输入设备选为 “CABLE Output”:\r\n没装? 到 vb-audio.com/Cable 免费下载。");
+            lbl(p, 10, 308, w - 16, 36, L"语音软件里把输入设备选为 “CABLE Output”:\r\n没装? 到 vb-audio.com/Cable 免费下载。");
         }
 
 
@@ -8232,14 +8031,14 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             HWND p = mkPanel(false);
             s_optPanels[3] = p;
             int w = PNL_W - 4;
-            grp(p, 0, 0, w, 150, L"音调 / 速度（CDJ 风格）");
-            chk(p, 10, 20, w - 20, 20, ID_OPT_PITCH_ENABLE, L"启用变调（同时改变音调和速度）", g_pitchEnabled);
+            grp(p, 0, 0, w, 196, L"音调 / 速度（CDJ 风格）");
+            chk(p, 10, 22, w - 20, 20, ID_OPT_PITCH_ENABLE, L"启用变调（同时改变音调和速度）", g_pitchEnabled);
 
             // Slider: -120 to +120 in units of 0.1 semitone
             int sliderVal = (int)roundf(g_pitchSemitones * 10.0f);
             HWND hSlider = CreateWindow(TRACKBAR_CLASS, NULL,
                 WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
-                10, 46, w - 80, 28, p, (HMENU)ID_OPT_PITCH_SLIDER, hInst, NULL);
+                10, 54, w - 90, 28, p, (HMENU)ID_OPT_PITCH_SLIDER, hInst, NULL);
             SendMessage(hSlider, TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
             SendMessage(hSlider, TBM_SETTICFREQ, 10, 0);  // tick every 1 semitone
             SendMessage(hSlider, TBM_SETPAGESIZE, 0, 10); // PgUp/Dn = 1 semitone
@@ -8247,15 +8046,21 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
             // Value edit: shows semitones with 1 decimal place
             wchar_t pbuf[16]; swprintf_s(pbuf, L"%.1f", g_pitchSemitones);
-            edt(p, w - 66, 48, 60, 22, ID_OPT_PITCH_VALUE, pbuf);
+            edt(p, w - 74, 56, 64, 22, ID_OPT_PITCH_VALUE, pbuf);
 
-            lbl(p, 10, 80, 40, 14, L"-12");
-            lbl(p, w/2 - 4, 80, 20, 14, L"0");
-            lbl(p, w - 72, 80, 24, 14, L"+12");
-            lbl(p, 10, 100, w - 20, 32,
-                L"负值 = 音调更低/速度更慢。正值 = 音调更高/速度更快。\n"
-                L"拖动滑块或输入数值（如 -8.4）。");
-            lbl(p, 10, 132, w - 20, 14, L"时间显示会随时长变化更新。");
+            // Tick labels aligned under the slider ends / midpoint
+            {
+                int sx = 10, sw = w - 90;
+                lbl(p, sx,            88, 30, 14, L"-12");
+                lbl(p, sx + sw/2 - 8, 88, 16, 14, L"0");
+                lbl(p, sx + sw - 30,  88, 30, 14, L"+12");
+            }
+
+            // Explanation — one short line per label, no wrapping overlap
+            lbl(p, 10, 112, w - 20, 16, L"负值 = 音调更低 / 速度更慢");
+            lbl(p, 10, 132, w - 20, 16, L"正值 = 音调更高 / 速度更快");
+            lbl(p, 10, 152, w - 20, 16, L"拖动滑块或输入数值（如 -8.4，范围 ±12）。");
+            lbl(p, 10, 172, w - 20, 14, L"时间显示会随时长变化更新。");
         }
 
         // Initialize page-0 scrollbar state (its WM_SHOWWINDOW fired before children existed)
@@ -8320,13 +8125,6 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             break;
         }
 
-        case ID_OPT_REC_BROWSE: {
-            wchar_t folder[MAX_PATH] = {};
-            if (PickFolder(hwnd, L"选择录音保存文件夹", folder, MAX_PATH)) {
-                SetDlgItemText(s_optPanels[2], ID_OPT_REC_PATH, folder);
-            }
-            break;
-        }
         case ID_OPT_DEVICE_RESET: {
             if (!s_optPanels[2]) break;
             HWND hCombo = GetDlgItem(s_optPanels[2], ID_OPT_DEVICE_COMBO);
@@ -8408,9 +8206,6 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             // Device page
             if (s_optPanels[2])
                 g_rememberVolume = (SendMessage(GetDlgItem(s_optPanels[2], ID_OPT_REMEMBER_VOL), BM_GETCHECK,0,0)==BST_CHECKED);
-            // Recording save path
-            if (s_optPanels[2])
-                GetDlgItemText(s_optPanels[2], ID_OPT_REC_PATH, g_recSaveDir, MAX_PATH);
             if (g_hwnd) LayoutControls(g_hwnd);
             // Timestretch page
             if (s_optPanels[3]) {
@@ -9577,9 +9372,7 @@ void LayoutControls(HWND hwnd)
     MoveWindow(hStopBtn, m + 2 * (bw + bs), y, bw, bh, TRUE);
     MoveWindow(hPrevBtn, m + 3 * (bw + bs), y, bw, bh, TRUE);
     MoveWindow(hNextBtn, m + 4 * (bw + bs), y, bw, bh, TRUE);
-    // Record button (red circle) right after transport, before Shuffle
-    if (hRecordBtn) MoveWindow(hRecordBtn, m + 5 * (bw + bs), y, bw, bh, TRUE);
-    int sbx = m + 5 * (bw + bs) + bw + 6;
+    int sbx = m + 5 * (bw + bs) + 6;
     MoveWindow(hShuffleBtn, sbx, y, 46, bh, TRUE);
     MoveWindow(hRepeatBtn, sbx + 50, y, 46, bh, TRUE);
     // Row 2: seek bar
@@ -9628,7 +9421,7 @@ void LayoutControls(HWND hwnd)
 
         int curW = max(baseW, 44);
         int totW = max(baseW + 18, 58);  // "/ " prefix
-        int remW = g_recording ? 130 : max(baseW + 10, 58);  // fixed wide when recording to fit "⏺ 999.9 MB"
+        int remW = max(baseW + 10, 58);
         MoveWindow(hTimeCur,    m,                          ty, curW, th, TRUE);
         MoveWindow(hTimeTot,    m + curW + 2,               ty, totW, th, TRUE);
         MoveWindow(hTimeRemain, m + curW + 2 + totW + 2,   ty, remW, th, TRUE);
@@ -9920,7 +9713,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         hNextBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, hInst, NULL);
         hShuffleBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_SHUFFLE, hInst, NULL);
         hRepeatBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_REPEAT, hInst, NULL);
-        hRecordBtn    = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_RECORD,    hInst, NULL);
         hMediaBtn     = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MEDIA,     hInst, NULL);
         hBackBtn      = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_BACK,      hInst, NULL);
 
@@ -9966,7 +9758,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SetWindowLongPtr(hNextBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hShuffleBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hRepeatBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hRecordBtn,    GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hBackBtn,      GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
 
         hStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL,
@@ -10308,7 +10099,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_BTN_SHUFFLE:    DrawBtn(dis, BTN_SHUFFLE);    return TRUE;
         case ID_BTN_REPEAT:     DrawBtn(dis, BTN_REPEAT);     return TRUE;
         case ID_BTN_MEDIA:      DrawBtn(dis, BTN_MEDIA);      return TRUE;
-        case ID_BTN_RECORD:    DrawBtn(dis, BTN_RECORD);    return TRUE;
         case ID_BTN_BACK:       DrawBtn(dis, BTN_BACK);       return TRUE;
         }
         break;
@@ -10711,10 +10501,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             break;
         }
-        case ID_BTN_RECORD:
-            if (g_recording) StopRecording();
-            else StartRecording();
-            break;
         case ID_BTN_MEDIA: {
             if (g_mediaFolders.empty()) break;
             if (!g_mediaActive) {
@@ -11071,7 +10857,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_DESTROY:
-        if (g_recording) StopRecording();   // finalize FLAC so file is seekable
         SaveSession();  // save playlist/track/position before stopping audio
         ClearThumbCache();
         if (g_thumbPlaceholder) { DeleteObject(g_thumbPlaceholder); g_thumbPlaceholder = NULL; }
