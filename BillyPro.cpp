@@ -920,64 +920,132 @@ static void WriteSoundHotkeyIni(const wchar_t* iniKey, const SoundHotkey* hk)
     }
 }
 
-// Global triggering no longer uses RegisterHotKey (an IME can eat those keys
-// before they reach us). A low-level keyboard hook sees keys BEFORE the IME,
+// Global triggering uses Raw Input (WM_INPUT) — NOT RegisterHotKey (an IME can
+// eat those keys) and NOT the old WH_KEYBOARD_LL hook (blocked by Riot Vanguard
+// and other anti-cheats). Raw Input is delivered at message level: it passes
+// anti-cheat untouched and sees the physical key before the IME consumes it,
 // so global sound/fn hotkeys fire even with Chinese input active.
-// The 4 media keys stay on RegisterHotKey — they never conflict.
-static HHOOK g_llKbHook      = NULL;
-static bool  g_llWasDown[256] = {};   // per-vk down state — mimics MOD_NOREPEAT
+// We maintain a per-vk down state array for combo (mods) matching and edge
+// detection (MOD_NOREPEAT emulation). The 4 media keys stay on RegisterHotKey.
+static BYTE g_riDown[256] = {};           // self-maintained per-vk down state
+static bool g_riHkDown[256] = {};         // per-vk edge state — mimics MOD_NOREPEAT
 
-static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lParam)
+// Raw input reports several extended keys with wrong/numpad VKs — correct via
+// the make code (E0-flagged keys are an exhaustive, fixed set).
+static UINT RiVirtualKey(const RAWKEYBOARD& rb)
 {
-    if (code >= 0 && g_hwnd && IsWindow(g_hwnd)) {
-        KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lParam;
-        UINT vk = (UINT)k->vkCode;
-        if (vk < 256) {
-            if (k->flags & LLKHF_UP) {
-                g_llWasDown[vk] = false;
-            } else if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-                bool isMediaKey = (vk == VK_MEDIA_PLAY_PAUSE || vk == VK_MEDIA_NEXT_TRACK ||
-                                   vk == VK_MEDIA_PREV_TRACK || vk == VK_MEDIA_STOP);
-                if (!isMediaKey) {
-                    UINT mods = 0;
-                    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
-                    if (GetAsyncKeyState(VK_MENU)    & 0x8000) mods |= MOD_ALT;
-                    if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) mods |= MOD_SHIFT;
-                    if (((USHORT)GetAsyncKeyState(VK_LWIN) | (USHORT)GetAsyncKeyState(VK_RWIN)) & 0x8000) mods |= MOD_WIN;
-                    int hit = -1;
-                    for (int i = 0; i < (int)g_soundHotkeys.size() && hit < 0; i++) {
-                        const SoundHotkey& hk = g_soundHotkeys[i];
-                        if (hk.global && hk.vk == vk && hk.mods == mods) hit = i;
-                    }
-                    for (int i = 0; i < FNHK_COUNT && hit < 0; i++) {
-                        const SoundHotkey& hk = g_fnHotkeys[i];
-                        if (hk.global && hk.vk == vk && hk.mods == mods) hit = 1000 + i;
-                    }
-                    if (hit >= 0) {
-                        bool repeat = g_llWasDown[vk];
-                        g_llWasDown[vk] = true;
-                        if (!repeat) {
-                            if (hit < 1000) PostMessage(g_hwnd, WM_HOTKEY, ID_HOTKEY_SND_BASE + hit, 0);
-                            else            PostMessage(g_hwnd, WM_HOTKEY, ID_HOTKEY_FN_BASE + (hit - 1000), 0);
-                        }
-                        return 1;   // bound key: swallow system-wide (trigger or held repeat)
-                    }
-                    g_llWasDown[vk] = false;
-                }
-            }
+    UINT vk = (UINT)rb.VKey;
+    if (vk == 0 || vk == VK_PACKET) return 0;
+    if (rb.Flags & RI_KEY_E0) {
+        if (rb.MakeCode == 0x2A || rb.MakeCode == 0x36) return 0;   // fake shift
+        switch (rb.MakeCode) {
+        case 0x1D: vk = VK_RCONTROL; break;
+        case 0x35: vk = VK_DIVIDE;   break;
+        case 0x38: vk = VK_RMENU;    break;
+        case 0x47: vk = VK_HOME;     break;
+        case 0x48: vk = VK_UP;       break;
+        case 0x49: vk = VK_PRIOR;    break;
+        case 0x4B: vk = VK_LEFT;     break;
+        case 0x4D: vk = VK_RIGHT;    break;
+        case 0x4F: vk = VK_END;      break;
+        case 0x50: vk = VK_DOWN;     break;
+        case 0x51: vk = VK_NEXT;     break;
+        case 0x52: vk = VK_INSERT;   break;
+        case 0x53: vk = VK_DELETE;   break;
+        case 0x5B: vk = VK_LWIN;     break;
+        case 0x5C: vk = VK_RWIN;     break;
+        case 0x5D: vk = VK_APPS;     break;
         }
     }
-    return CallNextHookEx(g_llKbHook, code, wParam, lParam);
+    return vk;
+}
+// Normalize L/R variants to the base VK the hotkey table stores
+static UINT RiBaseVk(UINT vk)
+{
+    if (vk == VK_LSHIFT   || vk == VK_RSHIFT)   return VK_SHIFT;
+    if (vk == VK_LCONTROL || vk == VK_RCONTROL) return VK_CONTROL;
+    if (vk == VK_LMENU    || vk == VK_RMENU)    return VK_MENU;
+    return vk;
+}
+// Anti-misfire: when a Win32 text-input control (Edit/Combo/RichEdit) holds the
+// keyboard focus — in BillyPro itself or in the foreground app — suppress all
+// raw-input hotkeys so typing/chatting never fires sounds.
+static bool RiTypingCls(HWND h)
+{
+    wchar_t cls[64];
+    if (!h || !GetClassNameW(h, cls, 64)) return false;
+    return _wcsicmp(cls, L"Edit") == 0 || _wcsicmp(cls, L"ComboBox") == 0 ||
+           _wcsnicmp(cls, L"RichEdit", 8) == 0 || _wcsicmp(cls, L"RICHEDIT50W") == 0;
+}
+static bool RiTypingFocus()
+{
+    HWND f = GetFocus();                    // focus inside BillyPro (our thread)
+    if (RiTypingCls(f)) return true;
+    GUITHREADINFO gi = { sizeof(gi) };      // focus inside the foreground app (any process)
+    if (GetGUIThreadInfo(0, &gi) && gi.hwndFocus && gi.hwndFocus != f)
+        return RiTypingCls(gi.hwndFocus);
+    return false;
 }
 
-static void InstallKeyboardHook()
+static void RiHandleKeyboard(HWND hwnd, const RAWKEYBOARD& rb)
 {
-    if (!g_llKbHook)
-        g_llKbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandleW(NULL), 0);
+    UINT vkRaw = RiVirtualKey(rb);
+    if (!vkRaw || vkRaw >= 256) return;
+    UINT vk = RiBaseVk(vkRaw);
+    if (rb.Flags & RI_KEY_BREAK) {
+        g_riDown[vk] = 0;
+        g_riHkDown[vk] = false;
+        return;
+    }
+    if (!(rb.Flags & RI_KEY_MAKE)) return;
+    g_riDown[vk] = 1;
+    bool isMediaKey = (vk == VK_MEDIA_PLAY_PAUSE || vk == VK_MEDIA_NEXT_TRACK ||
+                       vk == VK_MEDIA_PREV_TRACK || vk == VK_MEDIA_STOP);
+    if (isMediaKey) return;                 // RegisterHotKey owns these — no double trigger
+    if (RiTypingFocus()) return;            // anti-misfire: user is typing somewhere
+    UINT mods = 0;
+    if (g_riDown[VK_CONTROL] || (GetAsyncKeyState(VK_CONTROL) & 0x8000)) mods |= MOD_CONTROL;
+    if (g_riDown[VK_MENU]    || (GetAsyncKeyState(VK_MENU)    & 0x8000)) mods |= MOD_ALT;
+    if (g_riDown[VK_SHIFT]   || (GetAsyncKeyState(VK_SHIFT)   & 0x8000)) mods |= MOD_SHIFT;
+    if ((g_riDown[VK_LWIN] || g_riDown[VK_RWIN]) ||
+        (((USHORT)GetAsyncKeyState(VK_LWIN) | (USHORT)GetAsyncKeyState(VK_RWIN)) & 0x8000)) mods |= MOD_WIN;
+    int hit = -1;
+    for (int i = 0; i < (int)g_soundHotkeys.size() && hit < 0; i++) {
+        const SoundHotkey& hk = g_soundHotkeys[i];
+        if (hk.global && hk.vk == vk && hk.mods == mods) hit = i;
+    }
+    for (int i = 0; i < FNHK_COUNT && hit < 0; i++) {
+        const SoundHotkey& hk = g_fnHotkeys[i];
+        if (hk.global && hk.vk == vk && hk.mods == mods) hit = 1000 + i;
+    }
+    if (hit >= 0) {
+        if (!g_riHkDown[vk]) {              // edge trigger — held repeats ignored
+            g_riHkDown[vk] = true;
+            if (hit < 1000) PostMessage(hwnd, WM_HOTKEY, ID_HOTKEY_SND_BASE + hit, 0);
+            else            PostMessage(hwnd, WM_HOTKEY, ID_HOTKEY_FN_BASE + (hit - 1000), 0);
+        }
+    } else {
+        g_riHkDown[vk] = false;
+    }
 }
-static void ShutdownKeyboardHook()
+
+static bool RegisterRawKeyboard(HWND hwnd)
 {
-    if (g_llKbHook) { UnhookWindowsHookEx(g_llKbHook); g_llKbHook = NULL; }
+    RAWINPUTDEVICE rid = {};
+    rid.usUsagePage = 0x01;                 // Generic Desktop
+    rid.usUsage     = 0x06;                 // Keyboard
+    rid.dwFlags     = RIDEV_INPUTSINK;      // receive WM_INPUT even when not foreground
+    rid.hwndTarget  = hwnd;
+    return RegisterRawInputDevices(&rid, 1, sizeof(rid)) != FALSE;
+}
+static void UnregisterRawKeyboard()
+{
+    RAWINPUTDEVICE rid = {};
+    rid.usUsagePage = 0x01;
+    rid.usUsage     = 0x06;
+    rid.dwFlags     = RIDEV_REMOVE;         // unregister before the window dies
+    rid.hwndTarget  = NULL;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
 }
 
 // Play a bound sound; if it left the playlist, add it back first (Soundpad behavior)
@@ -9810,8 +9878,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         RegisterHotKey(hwnd, ID_HOTKEY_NEXT,      0, VK_MEDIA_NEXT_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_PREV,      0, VK_MEDIA_PREV_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_STOP,      0, VK_MEDIA_STOP);
-        // Low-level keyboard hook: global sound/fn hotkeys fire even under IME
-        InstallKeyboardHook();
+        // Raw Input keyboard: global sound/fn hotkeys fire even under IME (Vanguard-safe)
+        RegisterRawKeyboard(hwnd);
 
         // Resolve the mic-output (virtual cable) device at startup
         MicOutStartupResolve();
@@ -10230,6 +10298,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         break;
 
+    case WM_INPUT: {
+        // Raw keyboard path for global sound/fn hotkeys (see RiHandleKeyboard).
+        // DefWindowProc must run so the system frees the queued raw-input data.
+        BYTE riBuf[160] = {};
+        UINT riSize = sizeof(riBuf);
+        if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, riBuf, &riSize,
+                            sizeof(RAWINPUTHEADER)) != (UINT)-1) {
+            const RAWINPUT* ri = (const RAWINPUT*)riBuf;
+            if (ri->header.dwType == RIM_TYPEKEYBOARD)
+                RiHandleKeyboard(hwnd, ri->data.keyboard);
+        }
+        DefWindowProc(hwnd, msg, wParam, lParam);
+        return 0;
+    }
     case WM_HOTKEY:
         switch ((int)wParam) {
         case ID_HOTKEY_PLAYPAUSE: TogglePlayPause(); break;
@@ -10879,8 +10961,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         UnregisterHotKey(hwnd, ID_HOTKEY_NEXT);
         UnregisterHotKey(hwnd, ID_HOTKEY_PREV);
         UnregisterHotKey(hwnd, ID_HOTKEY_STOP);
-        // Uninstall the keyboard hook (global sound/fn hotkeys)
-        ShutdownKeyboardHook();
+        // Unregister Raw Input keyboard (global sound/fn hotkeys)
+        UnregisterRawKeyboard();
         // Release SMTC
         SmtcCleanup();
         // Release taskbar thumbnail
