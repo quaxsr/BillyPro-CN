@@ -119,7 +119,6 @@ extern "C" {
 
 // Audio info dialog
 #define ID_INFO_ARTWORK     401
-#define ID_INFO_TEXT        402
 #define ID_INFO_CLOSE       403
 #define ID_INFO_SAVE_ART    404
 #define ID_INFO_REPLACE_ART 405
@@ -314,8 +313,6 @@ static WNDPROC g_OldBtnProc    = NULL;
 static WNDPROC g_OldStatusProc = NULL;
 static HWND    g_hoveredBtn = NULL;
 
-static WNDPROC g_OldSearchProc = NULL;
-
 struct Track { wchar_t path[MAX_PATH]; wchar_t display[MAX_PATH]; };
 std::vector<Track> g_playlist;
 std::vector<Track> g_savedPlaylist;  // saved when media view is active
@@ -433,7 +430,7 @@ static wchar_t g_stLastText[512] = L"";
 void TogglePlayPause();
 void PlayNext();
 void PlayPrev();
-void SeekToSeconds(double sec);
+void SeekToSeconds(double sec, bool userSeek = false);
 void UpdateVolume();
 void LayoutControls(HWND hwnd);
 static double GetPlayPos();
@@ -524,6 +521,7 @@ static bool IsAudio(const wchar_t* p)
 // ============================================================
 void ClearPlaylist()
 {
+    if (currentStream) StopAudio();  // [中-18] 先停播再清列表:防"列表已清、旧流仍发声",且 g_currentIndex=-1 会让状态栏/会话失真
     g_playlist.clear(); g_shuffleOrder.clear(); g_currentIndex = -1;
     g_unsortedPlaylist.clear(); g_sortCol = -1; g_sortAsc = true;
     if (hListBox) SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
@@ -677,6 +675,7 @@ static void BrowserNavigate(int idx)
         g_playlist.clear();
         g_shuffleOrder.clear();
         g_currentIndex = -1;
+        g_unsortedPlaylist.clear();  // playlist replaced: drop stale sort snapshot
         int foundIdx = -1;
         for (auto& bi : g_browserItems) {
             if (!bi.isDir) {
@@ -735,6 +734,7 @@ void AddTrack(const wchar_t* path)
     Track t; wcsncpy_s(t.path, path, _TRUNCATE);
     wcsncpy_s(t.display, Filename(path), _TRUNCATE);
     g_playlist.push_back(t);
+    g_unsortedPlaylist.clear();  // content changed: drop stale sort snapshot (next sort re-takes it)
     if (hListBox) {
         wchar_t disp[MAX_PATH + 4];
         if (!g_favActive && IsFavorite(path))
@@ -760,12 +760,18 @@ void RebuildShuffleOrder()
 void LoadFolder(const wchar_t* folder)
 {
     ClearPlaylist();
-    wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", folder);
-    WIN32_FIND_DATA fd; HANDLE h = FindFirstFile(pat, &fd);
+    wchar_t pat[MAX_PATH];
+    // _TRUNCATE + check: a folder path near MAX_PATH must not hit the invalid
+    // parameter handler; a truncated pattern is unusable, so skip enumeration
+    bool patOk = _snwprintf_s(pat, _countof(pat), _TRUNCATE, L"%s\\*.*", folder) >= 0;
+    WIN32_FIND_DATA fd; HANDLE h = patOk ? FindFirstFile(pat, &fd) : INVALID_HANDLE_VALUE;
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", folder, fd.cFileName);
+                wchar_t full[MAX_PATH];
+                // Skip entries whose full path no longer fits MAX_PATH
+                if (_snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", folder, fd.cFileName) < 0)
+                    continue;
                 if (IsAudio(full)) AddTrack(full);
             }
         } while (FindNextFile(h, &fd));
@@ -892,7 +898,7 @@ static void LoadSoundHotkeys()
             const wchar_t* p2 = wcschr(v + 2, L'|');
             if (p2) mods = (UINT)_wtoi(p2 + 1);
         }
-        if (!vk) continue;
+        if (!vk || vk > 255) continue;   // [L-5] vk<=0/vk>255 never matches (raw vk < 256): drop ghost config
         SoundHotkey hk = {};
         HkDecodeKey(line, hk.path, MAX_PATH);
         if (!hk.path[0]) continue;
@@ -900,6 +906,18 @@ static void LoadSoundHotkeys()
         // Function hotkeys (@play/@pause/...) live in their own slots
         int fi = FNHK_BY_KEY(hk.path);
         if (fi >= 0) { g_fnHotkeys[fi] = hk; g_fnHotkeys[fi].path[0] = 0; continue; }
+        // [L-4] The four media VKs are owned by RegisterHotKey (built-in play control):
+        // RiHandleKeyboard returns before matching for them, so a sound binding on a
+        // media key can never fire -- drop it at load instead of exposing a dead key.
+        if (vk == VK_MEDIA_PLAY_PAUSE || vk == VK_MEDIA_NEXT_TRACK ||
+            vk == VK_MEDIA_PREV_TRACK || vk == VK_MEDIA_STOP) continue;
+        // [L-6] INI hand-written duplicate lines: keep only the first entry. Runtime
+        // matching, clear-binding and the bind dialog all act on the first match;
+        // later duplicates are invisible and impossible to remove individually.
+        bool dupPath = false;
+        for (int i = 0; i < (int)g_soundHotkeys.size() && !dupPath; i++)
+            if (_wcsicmp(g_soundHotkeys[i].path, hk.path) == 0) dupPath = true;
+        if (dupPath) continue;
         if ((int)g_soundHotkeys.size() < SNDHK_MAX)
             g_soundHotkeys.push_back(hk);
     }
@@ -928,7 +946,20 @@ static void WriteSoundHotkeyIni(const wchar_t* iniKey, const SoundHotkey* hk)
 // We maintain a per-vk down state array for combo (mods) matching and edge
 // detection (MOD_NOREPEAT emulation). The 4 media keys stay on RegisterHotKey.
 static BYTE g_riDown[256] = {};           // self-maintained per-vk down state
-static bool g_riHkDown[256] = {};         // per-vk edge state — mimics MOD_NOREPEAT
+static BYTE g_riHkDown[256] = {};         // per-(vk,mods) edge state: stores fired mods+1 (0 = armed; +1 so a no-modifier hotkey, mods 0, still differs from armed) — mimics MOD_NOREPEAT
+
+// Ghost-modifier healing: BREAK events are lost while a secure desktop (UAC
+// prompt / lock screen) is active — RIDEV_INPUTSINK receives no WM_INPUT there,
+// so a modifier released during that window would stay "down" in g_riDown
+// forever and corrupt every later mods match. Reset all key state on every
+// WM_ACTIVATE change and after rebinding; keys still physically held are
+// re-populated immediately by their autorepeat MAKEs (INPUTSINK keeps
+// delivering) and by the GetAsyncKeyState fallback in RiHandleKeyboard.
+static void RiClearKeyStates()
+{
+    memset(g_riDown, 0, sizeof(g_riDown));
+    memset(g_riHkDown, 0, sizeof(g_riHkDown));
+}
 
 // Raw input reports several extended keys with wrong/numpad VKs — correct via
 // the make code (E0-flagged keys are an exhaustive, fixed set).
@@ -967,7 +998,7 @@ static UINT RiBaseVk(UINT vk)
     if (vk == VK_LMENU    || vk == VK_RMENU)    return VK_MENU;
     return vk;
 }
-// Anti-misfire: when a Win32 text-input control (Edit/Combo/RichEdit) holds the
+// Anti-misfire: when a Win32 text-input control (Edit/Combo/RichEdit/Hotkey32) holds the
 // keyboard focus — in BillyPro itself or in the foreground app — suppress all
 // raw-input hotkeys so typing/chatting never fires sounds.
 static bool RiTypingCls(HWND h)
@@ -975,7 +1006,8 @@ static bool RiTypingCls(HWND h)
     wchar_t cls[64];
     if (!h || !GetClassNameW(h, cls, 64)) return false;
     return _wcsicmp(cls, L"Edit") == 0 || _wcsicmp(cls, L"ComboBox") == 0 ||
-           _wcsnicmp(cls, L"RichEdit", 8) == 0 || _wcsicmp(cls, L"RICHEDIT50W") == 0;
+           _wcsnicmp(cls, L"RichEdit", 8) == 0 || _wcsicmp(cls, L"RICHEDIT50W") == 0 ||
+           _wcsicmp(cls, L"msctls_hotkey32") == 0;  // hotkey bind dialog record control
 }
 static bool RiTypingFocus()
 {
@@ -994,7 +1026,7 @@ static void RiHandleKeyboard(HWND hwnd, const RAWKEYBOARD& rb)
     UINT vk = RiBaseVk(vkRaw);
     if (rb.Flags & RI_KEY_BREAK) {
         g_riDown[vk] = 0;
-        g_riHkDown[vk] = false;
+        g_riHkDown[vk] = 0;
         return;
     }
     if (!(rb.Flags & RI_KEY_MAKE)) return;
@@ -1019,14 +1051,14 @@ static void RiHandleKeyboard(HWND hwnd, const RAWKEYBOARD& rb)
         if (hk.global && hk.vk == vk && hk.mods == mods) hit = 1000 + i;
     }
     if (hit >= 0) {
-        if (!g_riHkDown[vk]) {              // edge trigger — held repeats ignored
-            g_riHkDown[vk] = true;
+        if (g_riHkDown[vk] != (BYTE)(mods + 1)) { // edge trigger — repeats of the same combo ignored
+            g_riHkDown[vk] = (BYTE)(mods + 1);
             if (hit < 1000) PostMessage(hwnd, WM_HOTKEY, ID_HOTKEY_SND_BASE + hit, 0);
             else            PostMessage(hwnd, WM_HOTKEY, ID_HOTKEY_FN_BASE + (hit - 1000), 0);
         }
-    } else {
-        g_riHkDown[vk] = false;
     }
+    // no else: a missed frame (e.g. a modifier tapped while the main key is held)
+    // must not re-arm the edge — g_riHkDown[vk] returns to 0 only on its BREAK
 }
 
 static bool RegisterRawKeyboard(HWND hwnd)
@@ -1121,11 +1153,7 @@ static void TriggerFnHotkey(int i)
 }
 static bool IsTypingFocus()
 {
-    HWND fw = GetFocus();
-    if (!fw) return false;
-    wchar_t cls[12] = L"";
-    if (GetClassNameW(fw, cls, 12) <= 0) return false;
-    return wcscmp(cls, L"Edit") == 0 || wcscmp(cls, L"ComboBox") == 0;
+    return RiTypingCls(GetFocus());         // same typing whitelist as the raw-input path
 }
 
 // --- Bind dialog (modal with its own pump, owner disabled while open) ---
@@ -1192,7 +1220,9 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     }
     case WM_COMMAND: {
         int cmd = LOWORD(wParam);
-        if (cmd == IDHK_CANCEL) { DestroyWindow(hwnd); return 0; }
+        // [L-10] IsDialogMessageW turns ESC into WM_COMMAND with IDCANCEL -- handle it
+        // like the cancel button or ESC can never close the dialog.
+        if (cmd == IDHK_CANCEL || cmd == IDCANCEL) { DestroyWindow(hwnd); return 0; }
         if (cmd == IDHK_CLEAR) {
             if (s_hkBindFn >= 0) {
                 g_fnHotkeys[s_hkBindFn] = SoundHotkey{};
@@ -1225,8 +1255,32 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                     L"绑定热键", MB_YESNO | MB_ICONWARNING) != IDYES)
                     return 0;
             }
+            // Cross-entry duplicate check: two bindings with the same (global, vk, mods)
+            // could both be saved, but only the first one ever matches at runtime
+            // (RiHandleKeyboard / MatchLocal* hotkeys return the first hit), so block
+            // the save here. A global and a local binding with the same vk+mods do not
+            // collide (separate dispatch paths) and stay allowed.
+            bool dup = false;
+            for (int i = 0; i < (int)g_soundHotkeys.size() && !dup; i++) {
+                const SoundHotkey& e = g_soundHotkeys[i];
+                if (s_hkBindFn < 0 && _wcsicmp(e.path, s_hkBindPath) == 0) continue;   // this entry
+                if (e.global == global && e.vk == vk && e.mods == mods) dup = true;
+            }
+            for (int i = 0; i < FNHK_COUNT && !dup; i++) {
+                if (s_hkBindFn >= 0 && i == s_hkBindFn) continue;                      // this entry
+                const SoundHotkey& e = g_fnHotkeys[i];
+                if (e.global == global && e.vk == vk && e.mods == mods) dup = true;
+            }
+            if (dup) {
+                MessageBoxW(hwnd, L"该组合已被本程序的其他绑定占用（同一组合只会触发最先匹配的绑定），请换一个组合。",
+                    L"绑定热键", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
             if (global) {
                 // Trial registration: is the combo free? (skip when it is already ours for this file)
+                // Known limits (accepted): TOCTOU -- the combo can be grabbed by another process
+                // between the UnregisterHotKey below and actual use, and combos held by other
+                // programs via Raw Input / low-level hooks are invisible to RegisterHotKey.
                 bool ours = false;
                 if (s_hkBindFn >= 0) {
                     const SoundHotkey& e = g_fnHotkeys[s_hkBindFn];
@@ -1253,15 +1307,12 @@ static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
                 else if ((int)g_soundHotkeys.size() < SNDHK_MAX) g_soundHotkeys.push_back(nhk);
                 WriteSoundHotkeyIni(s_hkBindPath, &nhk);
             }
+            RiClearKeyStates();   // rebind: start the new bindings from a clean key state
             DestroyWindow(hwnd);
             return 0;
         }
         break;
     }
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
-        if (wParam == VK_RETURN) { SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDHK_OK, 0), 0); return 0; }
-        break;
     case WM_DESTROY:
         g_hwndHotkeyDlg = NULL;
         return 0;
@@ -1297,6 +1348,7 @@ static void OpenHotkeyBindDialog(const wchar_t* path, int fnIdx)
     HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"BillyHotkeyDlg", cap,
         WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, ww, wh, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
     if (!dlg) return;
+    g_hwndHotkeyDlg = dlg;   // mark the open dialog so the re-entry guard above works
     EnableWindow(g_hwnd, FALSE);
     ShowWindow(dlg, SW_SHOW);
     UpdateWindow(dlg);
@@ -1331,11 +1383,13 @@ static DWORD   g_micTapLastFlush = 0;            // seek-flush coalescing
 static int     g_micTapFails = 0;                // consecutive push failures
 static bool    g_micOutMissingShown = false;     // one-time guidance popups
 static bool    g_micOutHintShown = false;
+static bool    g_micOutDevFailShown = false;     // [中-2] one-time cable-failure notice
 static CRITICAL_SECTION g_micTapCs;              // guards g_micTapStream (mix thread vs UI)
 static struct MicTapCsInit { MicTapCsInit() { InitializeCriticalSection(&g_micTapCs); } ~MicTapCsInit() { DeleteCriticalSection(&g_micTapCs); } } g_micTapCsInit;
 
 #define MICOUT_WM_TAPLOST   (WM_APP + 96)   // cable device died during playback
 #define MICOUT_WM_STARTHINT (WM_APP + 97)   // deferred guidance popup
+#define MICOUT_WM_DEVFAIL   (WM_APP + 100)  // [中-2] mode-0 master: cable device failed (BASS_SYNC_DEV_FAIL)
 
 static wchar_t MicOutUp(wchar_t c) { return (c >= L'a' && c <= L'z') ? (wchar_t)(c - L'a' + L'A') : c; }
 static bool MicOutContainsI(const wchar_t* hay, const wchar_t* needle)
@@ -1393,6 +1447,9 @@ static bool MicOutEnsureDevice()
     g_micOutDev = idx;
     BASS_DEVICEINFO di = {};
     BASS_GetDeviceInfo(idx, &di);
+    // [中-1] 设备可能刚消失却残留 BASS_DEVICE_INIT:槽位必须仍 ENABLED 才继续挂载,
+    // 死设备不得被 INIT 标志当成“就绪”短路。
+    if (!(di.flags & BASS_DEVICE_ENABLED)) { g_micOutDev = -1; return false; }
     int prevCtx = BASS_GetDevice();   // BASS_Init 会切换当前设备上下文，完成后必须切回主输出
     if (!(di.flags & BASS_DEVICE_INIT) && !BASS_Init(idx, 48000, 0, NULL, NULL)) {
         BASS_SetDevice(prevCtx);
@@ -1435,6 +1492,22 @@ static void MicOutRouteEnd(int prev)
 {
     if (prev >= 0) BASS_SetDevice(prev);
 }
+// [中-2] mode-0 master lives on the cable device with no tap to notice its
+// death — arm a BASS_SYNC_DEV_FAIL sync so the failure is reported instead of
+// the stream dying silently while the UI timer keeps polling.
+static void CALLBACK MicOutDevFailSync(HSYNC, DWORD, DWORD, void*)
+{
+    if (g_hwnd) PostMessage(g_hwnd, MICOUT_WM_DEVFAIL, 0, 0);
+}
+// Arm only when the master is really hosted on the cable device; mode 0 falls
+// back to the speaker when the cable is unavailable (MicOutRouteBegin -> -1).
+static void MicOutArmDevFailSync()
+{
+    if (!g_micOutEnabled || !currentStream || !g_hwnd) return;
+    DWORD chDev = BASS_ChannelGetDevice(currentStream);
+    if (g_micOutDev <= 0 || chDev != (DWORD)g_micOutDev) return;
+    BASS_ChannelSetSync(currentStream, BASS_SYNC_DEV_FAIL, 0, MicOutDevFailSync, g_hwnd);
+}
 // Tap DSP (priority 0 = runs after the FX chain at 1..10, before output volume)
 static void CALLBACK MicTapDSP(HDSP, DWORD, void* buffer, DWORD length, void*)
 {
@@ -1456,14 +1529,13 @@ static void CALLBACK MicTapDSP(HDSP, DWORD, void* buffer, DWORD length, void*)
 }
 static void MicOutStopTap()
 {
-    if (g_micTapDsp) {
-        if (currentStream) BASS_ChannelRemoveDSP(currentStream, g_micTapDsp);
-        g_micTapDsp = NULL;
-    }
     EnterCriticalSection(&g_micTapCs);
+    HDSP dsp = g_micTapDsp;                      // [L-1] g_micTapDsp 读写入临界区
+    g_micTapDsp = NULL;
     HSTREAM s = g_micTapStream;
     g_micTapStream = NULL;
     LeaveCriticalSection(&g_micTapCs);
+    if (dsp && currentStream) BASS_ChannelRemoveDSP(currentStream, dsp);
     if (s) BASS_StreamFree(s);
     g_micTapFails = 0;
 }
@@ -1487,7 +1559,11 @@ static void MicOutMaybeAttachTap()
     g_micTapLimit  = max(0x8000, (DWORD)ci.freq * ci.chans * 4);   // ~1s of float audio
     LeaveCriticalSection(&g_micTapCs);
     g_micTapFails = 0;
-    g_micTapDsp = BASS_ChannelSetDSP(currentStream, MicTapDSP, NULL, 0);
+    // [L-1] 句柄写入入临界区;BASS_ChannelSetDSP 本身留在 CS 外——持锁调 BASS 会与音频线程的 MicTapDSP 回调互等死锁
+    HDSP dsp = BASS_ChannelSetDSP(currentStream, MicTapDSP, NULL, 0);
+    EnterCriticalSection(&g_micTapCs);
+    g_micTapDsp = dsp;
+    LeaveCriticalSection(&g_micTapCs);
     BASS_ChannelSetAttribute(s, BASS_ATTRIB_VOL, currentVolume);
     BASS_ChannelPlay(s, FALSE);
 }
@@ -1507,27 +1583,44 @@ static void MicOutUpdateTapVolume()
     LeaveCriticalSection(&g_micTapCs);
     if (s) BASS_ChannelSetAttribute(s, BASS_ATTRIB_VOL, currentVolume);
 }
-static void MicOutFlushTap()
+static void MicOutFlushTap(bool force)
 {
     if (!g_micTapStream) return;
     DWORD now = GetTickCount();
-    if (now - g_micTapLastFlush < 250) return;   // coalesce seek-repeat storms
+    if (!force && now - g_micTapLastFlush < 250) return;   // coalesce seek-repeat storms
     g_micTapLastFlush = now;
     MicOutMaybeAttachTap();                      // rebuild = drops stale queued audio
 }
 static void MicOutApplySettings(bool justEnabled)
 {
-    if (!g_micOutEnabled) { MicOutStopTap(); MicOutReleaseDevice(); return; }
     bool wasPlaying = currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING;
     double pos = wasPlaying ? GetPlayPos() : 0.0;
     int curIdx = g_currentIndex;
+    // Where does the master stream live right now? Mode 0 hosts it on the cable
+    // device, and BASS_Free() in MicOutReleaseDevice frees EVERYTHING on that
+    // device — a cable-hosted master MUST go through StopAudio() first, or
+    // currentStream is left dangling (zombie playback). Conversely, mode 0
+    // requires the master on the cable, so a speaker-hosted master must be
+    // rebuilt when switching into mode 0.
+    DWORD chDev = currentStream ? BASS_ChannelGetDevice(currentStream) : 0;
+    bool masterOnCable = currentStream && g_micOutDev > 0 && chDev == (DWORD)g_micOutDev;
+    bool rebuild = currentStream &&
+        ((g_micOutMode == 0) ? !masterOnCable : masterOnCable);
+
+    if (!g_micOutEnabled) {
+        MicOutStopTap();
+        if (masterOnCable) StopAudio();   // free the cable-hosted master BEFORE the device dies
+        MicOutReleaseDevice();
+        return;
+    }
     MicOutStopTap();
-    if (g_micOutMode == 0 && wasPlaying) StopAudio();   // master lived on the old cable
+    if (rebuild) StopAudio();             // master must move to the device the new mode needs
     MicOutReleaseDevice();
     bool ok = MicOutEnsureDevice();
-    if (ok && g_micOutMode == 0 && wasPlaying && curIdx >= 0 && curIdx < (int)g_playlist.size()) {
-        PlayIndex(curIdx);
+    if (ok && rebuild && curIdx >= 0 && curIdx < (int)g_playlist.size()) {
+        PlayIndex(curIdx);                // rebuild the master in the new mode
         if (pos > 1.0) SeekToSeconds(pos);
+        if (!wasPlaying) PauseOnly();     // keep a paused song paused across the rebuild
     }
     if (ok && g_micOutMode == 1 && currentStream)
         MicOutMaybeAttachTap();
@@ -1735,6 +1828,7 @@ static void LoadBppPlaylist(const wchar_t* path)
 
     // Load into playlist
     g_playlist.clear();
+    g_unsortedPlaylist.clear();  // playlist replaced: drop stale sort snapshot
     for (auto& p : paths) {
         Track t;
         wcsncpy_s(t.path, MAX_PATH, p.c_str(), _TRUNCATE);
@@ -1760,19 +1854,6 @@ static void AddTrackToPlaylist(const wchar_t* bppPath, const wchar_t* trackPath)
     if (!f) return;
     fwprintf(f, L"%s\n", trackPath);
     fclose(f);
-}
-
-static void CreateNewPlaylist(const wchar_t* name, const wchar_t* initialTrack)
-{
-    GetLibDir();
-    wchar_t path[MAX_PATH];
-    swprintf_s(path, MAX_PATH, L"%s\\%s.bpp", g_plDir, name);
-    FILE* f = _wfopen(path, L"w,ccs=UTF-8");
-    if (!f) return;
-    if (initialTrack && initialTrack[0])
-        fwprintf(f, L"%s\n", initialTrack);
-    fclose(f);
-    ScanPlaylists();
 }
 
 static void ShowNewPlaylistDialog(HWND hwnd, const wchar_t* trackPath)
@@ -1818,6 +1899,7 @@ static void LibRestorePlaylist()
     g_favActive = false;
     g_libActivePlaylist = -1;
     g_playlist = g_libSavedPlaylist;
+    g_unsortedPlaylist.clear();  // playlist swapped back: sort snapshot may be stale
     g_libSavedPlaylist.clear();
     g_currentIndex = g_libSavedIndex;
     if (hListBox) {
@@ -1852,6 +1934,7 @@ static void LibSaveIfNeeded()
 static void LibShowTracks(const std::vector<std::wstring>& paths)
 {
     g_playlist.clear();
+    g_unsortedPlaylist.clear();  // playlist replaced: drop stale sort snapshot
     for (auto& p : paths) {
         Track t;
         wcsncpy_s(t.path, MAX_PATH, p.c_str(), _TRUNCATE);
@@ -2140,8 +2223,14 @@ static void SaveSession()
     double pos = (g_rememberSession >= 2 && currentStream) ? GetPlayPos() : 0.0;
     fwprintf(f, L"%.3f\n", pos);
     // Remaining lines: path<TAB>display per track (TAB separates path from display name)
-    for (auto& t : g_playlist)
-        fwprintf(f, L"%s\t%s\n", t.path, t.display);
+    // A TAB inside display would break the column split on restore - replace with space
+    for (auto& t : g_playlist) {
+        wchar_t disp[MAX_PATH];
+        wcscpy_s(disp, t.display);
+        for (wchar_t* p = disp; *p; ++p)
+            if (*p == L'\t') *p = L' ';
+        fwprintf(f, L"%s\t%s\n", t.path, disp);
+    }
     fclose(f);
 }
 
@@ -2307,18 +2396,36 @@ void ApplyPitch()
 void AddFolder(const wchar_t* folder)
 {
     // Like LoadFolder but does NOT clear existing playlist
-    wchar_t pat[MAX_PATH]; swprintf_s(pat, L"%s\\*.*", folder);
-    WIN32_FIND_DATA fd; HANDLE h = FindFirstFile(pat, &fd);
+    wchar_t pat[MAX_PATH];
+    // _TRUNCATE + check: a folder path near MAX_PATH must not hit the invalid
+    // parameter handler; a truncated pattern is unusable, so skip enumeration
+    bool patOk = _snwprintf_s(pat, _countof(pat), _TRUNCATE, L"%s\\*.*", folder) >= 0;
+    WIN32_FIND_DATA fd; HANDLE h = patOk ? FindFirstFile(pat, &fd) : INVALID_HANDLE_VALUE;
     if (h != INVALID_HANDLE_VALUE) {
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                wchar_t full[MAX_PATH]; swprintf_s(full, L"%s\\%s", folder, fd.cFileName);
+                wchar_t full[MAX_PATH];
+                // Skip entries whose full path no longer fits MAX_PATH
+                if (_snwprintf_s(full, _countof(full), _TRUNCATE, L"%s\\%s", folder, fd.cFileName) < 0)
+                    continue;
                 if (IsAudio(full)) AddTrack(full);
             }
         } while (FindNextFile(h, &fd));
         FindClose(h);
     }
 }
+
+// Stream handle that the UI thread should free (deferred from the mixing
+// thread via GaplessProc) — declared before StopAudio so it can consume it.
+static volatile HSTREAM g_decOldToFree = 0;
+
+// Set by StopAudio before it releases the decode streams: while set, GaplessProc
+// outputs silence at its entry and at the top of every mixing round without
+// touching g_decStream/g_decNext — BASS_ChannelLock only fences new BASS calls
+// on the master, it cannot stop a round already running on the mixing thread.
+// Cleared whenever a new GaplessProc master is built and BASS_ChannelPlay
+// succeeds (PlayIndex, WM_PLAYNEXT(2) rebuild).
+static volatile LONG g_gaplessHalt = 0;
 
 void StopAudio()
 {
@@ -2335,6 +2442,10 @@ void StopAudio()
         g_radioStationName[0] = L'\0';
         g_radioNowPlaying[0] = L'\0';
     }
+    // Halt GaplessProc before touching any decode stream handle: the lock below
+    // cannot stop a mixing-thread round already in flight, but the flag makes
+    // GaplessProc emit silence and bail out without reading g_decNext/g_decStream.
+    InterlockedExchange(&g_gaplessHalt, 1);
     // Lock the master stream so GaplessProc can't read decode streams while we free them
     if (currentStream) BASS_ChannelLock(currentStream, TRUE);
     g_dcaDec = nullptr;
@@ -2353,6 +2464,7 @@ void StopAudio()
     if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
     g_decNextIdx = -1;
     if (g_decStream) { BASS_StreamFree(g_decStream); g_decStream = 0; }
+    if (g_decOldToFree) { BASS_StreamFree(g_decOldToFree); g_decOldToFree = 0; }   // consume the deferred free (was leaking one decode stream per track change)
     if (currentStream) {
         BASS_ChannelLock(currentStream, FALSE);
         BASS_ChannelStop(currentStream);
@@ -2373,10 +2485,15 @@ void StopAudio()
     SmtcUpdatePlaybackStatus();
     if (hListBox) InvalidateRect(hListBox, NULL, FALSE); // clear now-playing highlight
     SetWindowText(g_hwnd, APP_TITLE);
+    // A WM_PLAYNEXT may already sit in the queue when the user stops right as a
+    // track ends naturally (GaplessProc posted it before the stop): its branch 1
+    // would set g_currentIndex = g_decNextIdx (already -1) and branch 0 would
+    // auto-start the next track after an explicit stop. Drain only pending
+    // WM_PLAYNEXT for this window - no other queued message is touched.
+    MSG msgDrain = {};
+    while (PeekMessageW(&msgDrain, g_hwnd, WM_PLAYNEXT, WM_PLAYNEXT, PM_REMOVE)) { }
 }
 
-// Stream handle that the UI thread should free (deferred from callback)
-static volatile HSTREAM g_decOldToFree = 0;
 // Set during seek to prevent GaplessProc from misinterpreting -1 as end-of-stream
 static volatile LONG g_seeking = 0;
 
@@ -2386,7 +2503,20 @@ static DWORD CALLBACK GaplessProc(HSTREAM handle, void* buffer, DWORD length, vo
     BYTE* buf = (BYTE*)buffer;
     DWORD total = 0;
 
+    // StopAudio may be freeing the decode streams right now — output silence
+    // and leave without touching any decode stream handle.
+    if (g_gaplessHalt) {
+        memset(buf, 0, length);
+        return length;
+    }
+
     while (total < length) {
+        // Halt raised mid-round (StopAudio freeing decode streams): pad the rest
+        // with silence and leave without touching any decode stream handle.
+        if (g_gaplessHalt) {
+            memset(buf + total, 0, length - total);
+            return length;
+        }
         if (!g_decStream) break;
 
         DWORD got = BASS_ChannelGetData(g_decStream, buf + total, length - total);
@@ -2460,18 +2590,23 @@ static double GetPitchSpeedRatio()
     return pow(2.0, g_pitchSemitones / 12.0);
 }
 
-void SeekToSeconds(double sec)
+void SeekToSeconds(double sec, bool userSeek)
 {
     if (!currentStream) return;
-    MicOutFlushTap();   // drop stale queued audio in the mic-output tap
+    MicOutFlushTap(userSeek);   // drop stale queued audio in the mic-output tap
     if (sec < 0) sec = 0;
     double rawSec = sec * GetPitchSpeedRatio();
 
-    // DTS seek via dcadec direct file I/O
+    // DTS seek via dcadec direct file I/O.
+    // Lock the master stream so the mixing thread (DcaStreamProc → DcaReadFrame /
+    // DcaDecodeFrame) can't touch the FILE* / decoder state while we seek on the
+    // UI thread — same discipline as the FLAC and normal branches below.
     if (g_dcaDec) {
         extern void DcaSeek(double sec);
+        BASS_ChannelLock(currentStream, TRUE);
         DcaSeek(rawSec);
         if (currentStream) BASS_ChannelPlay(currentStream, TRUE);
+        BASS_ChannelLock(currentStream, FALSE);
         UpdateTimeDisplays();
         if (hSeekCanvas) InvalidateRect(hSeekCanvas, NULL, FALSE);
         return;
@@ -2676,6 +2811,12 @@ static size_t DcaReadFrame(DcaDecoder* d)
     if (bufSize > d->frameBufCap) {
         free(d->frameBuf);
         d->frameBuf = (uint8_t*)malloc(bufSize);
+        if (!d->frameBuf) {
+            d->frameBufCap = 0;
+            return 0;   // allocation failed: signal a read error. Do not free the
+                        // decoder here (DcaFreeData deletes d while callers still
+                        // touch it); the existing error paths free it instead
+        }
         d->frameBufCap = bufSize;
     }
     memset(d->frameBuf, 0, bufSize);
@@ -3139,6 +3280,7 @@ void PlayIndex(int idx)
         g_radioNowPlaying[0] = L'\0';
         BASS_ChannelSetAttribute(currentStream, BASS_ATTRIB_VOL, currentVolume);
         MicOutMaybeAttachTap();   // "both" mode: mirror into the cable
+        MicOutArmDevFailSync();   // [中-2] mode 0: watch the cable-hosted master
         BASS_ChannelPlay(currentStream, FALSE);
         SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
         SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
@@ -3158,8 +3300,11 @@ void PlayIndex(int idx)
     g_lastDcaDec = nullptr;
     g_lastFlacDec = nullptr;
     int prevDev = MicOutRouteBegin();   // "only" mode: decode + master on the virtual cable
-    if (IsDtsWav(g_playlist[idx].path))
+    bool dtsFailed = false;   // [中-4] DTS-WAV self-decode failed: no fallback to plain BASS (decodes DTS-in-WAV as noise)
+    if (IsDtsWav(g_playlist[idx].path)) {
         dec = CreateDtsStream(g_playlist[idx].path);
+        if (!dec) dtsFailed = true;
+    }
     if (dec && g_lastDcaDec) {
         DcaActivate();
     } else {
@@ -3172,15 +3317,20 @@ void PlayIndex(int idx)
     } else if (!g_flacDec) {
         g_lastFlacDec = nullptr;
     }
-    if (!dec)
+    if (!dec && !dtsFailed)   // [中-4] no noise fallback for a failed DTS-WAV
         dec = BASS_StreamCreateFile(FALSE, g_playlist[idx].path, 0, 0,
             BASS_UNICODE | BASS_SAMPLE_FLOAT | BASS_STREAM_DECODE);
     if (!dec) {
-        wchar_t msg[MAX_PATH + 80];
-        swprintf_s(msg, L"无法打开:\n%s\n\nBASS 错误: %d",
-            g_playlist[idx].path, BASS_ErrorGetCode());
-        MessageBox(g_hwnd, msg, L"播放错误", MB_ICONERROR);
         MicOutRouteEnd(prevDev);
+        if (dtsFailed) {
+            // [中-4] DTS decode failure: one-time notice, then the failure path (no noise stream)
+            MessageBox(g_hwnd, L"该 DTS 文件无法解码,已跳过", L"播放提示", MB_ICONWARNING);
+        } else {
+            wchar_t msg[MAX_PATH + 80];
+            swprintf_s(msg, L"无法打开:\n%s\n\nBASS 错误: %d",
+                g_playlist[idx].path, BASS_ErrorGetCode());
+            MessageBox(g_hwnd, msg, L"播放错误", MB_ICONERROR);
+        }
         return;
     }
 
@@ -3197,6 +3347,12 @@ void PlayIndex(int idx)
     if (!currentStream) {
         BASS_StreamFree(dec);
         g_decStream = 0;
+        // [L-2] 主流创建失败:清掉本轨刚填入的 DTS/FLAC 解码状态,状态栏/时长不得取到旧值
+        g_dcaDuration = 0;
+        g_dcaSampleRate = 0;
+        g_dcaChannels = 0;
+        g_flacDuration = 0;
+        g_flacSampleRate = 0;
         return;
     }
     g_masterFreq  = ci.freq;
@@ -3207,6 +3363,7 @@ void PlayIndex(int idx)
     BASS_ChannelSetSync(currentStream, BASS_SYNC_END, 0, EndSyncProc, g_hwnd);
     ApplyPitch();
     MicOutMaybeAttachTap();   // "both" mode: mirror the master into the cable
+    MicOutArmDevFailSync();   // [中-2] mode 0: watch the cable-hosted master
     if (g_hwnd) LayoutControls(g_hwnd);
     if (hTimeTot) {
         wchar_t buf[32], tot[40];
@@ -3214,7 +3371,8 @@ void PlayIndex(int idx)
         swprintf_s(tot, L"/ %s", buf);
         SetWindowText(hTimeTot, tot);
     }
-    BASS_ChannelPlay(currentStream, FALSE);
+    if (BASS_ChannelPlay(currentStream, FALSE))
+        InterlockedExchange(&g_gaplessHalt, 0);   // new GaplessProc master live — clear the halt StopAudio raised above
     SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
     SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
 
@@ -3286,7 +3444,7 @@ void PlayNext()
 void PlayPrev()
 {
     if (g_playlist.empty()) return;
-    if (currentStream && GetPlayPos() > 3.0) { SeekToSeconds(0); return; }
+    if (currentStream && GetPlayPos() > 3.0) { SeekToSeconds(0, true); return; }
     int prev;
     if (g_shuffle && !g_shuffleOrder.empty()) {
         int p = 0;
@@ -3335,8 +3493,11 @@ void PreloadNext()
     g_dcaDecNext = nullptr;
     g_lastFlacDec = nullptr;
     g_flacDecNext = nullptr;
-    if (IsDtsWav(g_playlist[next].path))
+    bool dtsFailed = false;   // [中-4] DTS-WAV self-decode failed: skip preload, do not fall back (noise)
+    if (IsDtsWav(g_playlist[next].path)) {
         dec = CreateDtsStream(g_playlist[next].path);
+        if (!dec) dtsFailed = true;
+    }
     if (dec && g_lastDcaDec) {
         g_dcaDecNext = g_lastDcaDec;
         g_lastDcaDec = nullptr;
@@ -3347,7 +3508,7 @@ void PreloadNext()
         g_flacDecNext = g_lastFlacDec;
         g_lastFlacDec = nullptr;
     }
-    if (!dec)
+    if (!dec && !dtsFailed)   // [中-4] no noise fallback; without a preload, track end routes through PlayNext → PlayIndex which reports the skip
         dec = BASS_StreamCreateFile(FALSE, g_playlist[next].path, 0, 0,
             BASS_UNICODE | BASS_SAMPLE_FLOAT | BASS_STREAM_DECODE);
     if (!dec) return;
@@ -3401,7 +3562,7 @@ void UpdateTrayTooltip()
     nid.uID = 1;
     nid.uFlags = NIF_TIP;
     if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
-        swprintf_s(nid.szTip, L"BillyPro - %s", g_playlist[g_currentIndex].display);
+        _snwprintf_s(nid.szTip, _countof(nid.szTip), _TRUNCATE, L"BillyPro - %s", g_playlist[g_currentIndex].display);
     else
         wcsncpy_s(nid.szTip, L"BillyPro", _TRUNCATE);
     Shell_NotifyIcon(NIM_MODIFY, &nid);
@@ -3438,7 +3599,7 @@ void UpdateStatusBar()
     wchar_t left[256] = L"就绪", right[128] = L"";
 
     if (!g_playlist.empty() && !currentStream)
-        swprintf_s(left, L"%d 个文件", (int)g_playlist.size());
+        _snwprintf_s(left, _countof(left), _TRUNCATE, L"%d 个文件", (int)g_playlist.size());
 
     if (currentStream) {
         if (g_radioPlaying) {
@@ -3448,7 +3609,7 @@ void UpdateStatusBar()
             else
                 _snwprintf_s(left, _countof(left), _TRUNCATE, L"\u25B6 %s", g_radioStationName);
         } else if (g_currentIndex >= 0 && g_currentIndex < (int)g_playlist.size())
-            swprintf_s(left, L"%d / %d  %s",
+            _snwprintf_s(left, _countof(left), _TRUNCATE, L"%d / %d  %s",
                 g_currentIndex + 1, (int)g_playlist.size(),
                 g_playlist[g_currentIndex].display);
         BASS_CHANNELINFO info = {};
@@ -3513,25 +3674,25 @@ void UpdateStatusBar()
                 if (bits <= 0) bits = (info.flags & BASS_SAMPLE_FLOAT) ? 32 :
                     (info.flags & BASS_SAMPLE_8BITS) ? 8 : 16;
                 if (enc[0])
-                    swprintf_s(right, L"WAV %d-bit  %d Hz  %s  [%s]", bits, info.freq, ch, enc);
+                    _snwprintf_s(right, _countof(right), _TRUNCATE, L"WAV %d-bit  %d Hz  %s  [%s]", bits, info.freq, ch, enc);
                 else
-                    swprintf_s(right, L"WAV %d-bit  %d Hz  %s", bits, info.freq, ch);
+                    _snwprintf_s(right, _countof(right), _TRUNCATE, L"WAV %d-bit  %d Hz  %s", bits, info.freq, ch);
             }
             else if (brate > 0) {
                 if (enc[0])
-                    swprintf_s(right, L"%s %.0f kbps  %d Hz  %s  [%s]", fmt, brate, info.freq, ch, enc);
+                    _snwprintf_s(right, _countof(right), _TRUNCATE, L"%s %.0f kbps  %d Hz  %s  [%s]", fmt, brate, info.freq, ch, enc);
                 else
-                    swprintf_s(right, L"%s %.0f kbps  %d Hz  %s", fmt, brate, info.freq, ch);
+                    _snwprintf_s(right, _countof(right), _TRUNCATE, L"%s %.0f kbps  %d Hz  %s", fmt, brate, info.freq, ch);
             }
             else {
                 if (enc[0])
-                    swprintf_s(right, L"%s  %d Hz  %s  [%s]", fmt, info.freq, ch, enc);
+                    _snwprintf_s(right, _countof(right), _TRUNCATE, L"%s  %d Hz  %s  [%s]", fmt, info.freq, ch, enc);
                 else
-                    swprintf_s(right, L"%s  %d Hz  %s", fmt, info.freq, ch);
+                    _snwprintf_s(right, _countof(right), _TRUNCATE, L"%s  %d Hz  %s", fmt, info.freq, ch);
             }
         }
         if (BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PAUSED) {
-            wchar_t tmp[256]; swprintf_s(tmp, L"%s  [已暂停]", right);
+            wchar_t tmp[256]; _snwprintf_s(tmp, _countof(tmp), _TRUNCATE, L"%s  [已暂停]", right);
             wcsncpy_s(right, tmp, _TRUNCATE);
         }
     }
@@ -3618,7 +3779,7 @@ LRESULT CALLBACK SeekBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_LBUTTONUP:
         if (g_seekDragging) {
             ReleaseCapture(); g_seekDragging = false;
-            SeekToSeconds(FracFromX(hwnd, GET_X_LPARAM(lParam)) * GetTrackLength());
+            SeekToSeconds(FracFromX(hwnd, GET_X_LPARAM(lParam)) * GetTrackLength(), true);
             InvalidateRect(hwnd, NULL, FALSE);
         }
         return 0;
@@ -3768,34 +3929,6 @@ LRESULT CALLBACK VolBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // ============================================================
 //  Transport buttons (GDI polygon drawing)
 // ============================================================
-static void FillCentered(HDC dc, RECT rc, int w, int h, COLORREF c)
-{
-    int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
-    RECT r = { cx - w / 2,cy - h / 2,cx - w / 2 + w,cy - h / 2 + h };
-    HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br);
-}
-static void TriRight(HDC dc, int cx, int cy, int half, COLORREF c)
-{
-    POINT p[3] = { {cx - half,cy - half},{cx - half,cy + half},{cx + half,cy} };
-    HBRUSH br = CreateSolidBrush(c); HPEN pn = CreatePen(PS_SOLID, 1, c);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, br); HPEN op = (HPEN)SelectObject(dc, pn);
-    Polygon(dc, p, 3); SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(br); DeleteObject(pn);
-}
-static void TriLeft(HDC dc, int cx, int cy, int half, COLORREF c)
-{
-    POINT p[3] = { {cx + half,cy - half},{cx + half,cy + half},{cx - half,cy} };
-    HBRUSH br = CreateSolidBrush(c); HPEN pn = CreatePen(PS_SOLID, 1, c);
-    HBRUSH ob = (HBRUSH)SelectObject(dc, br); HPEN op = (HPEN)SelectObject(dc, pn);
-    Polygon(dc, p, 3); SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(br); DeleteObject(pn);
-}
-static void VBar(HDC dc, int cx, int cy, int h2, COLORREF c)
-{
-    RECT r = { cx - 2,cy - h2,cx + 2,cy + h2 + 1 };
-    HBRUSH br = CreateSolidBrush(c); FillRect(dc, &r, br); DeleteObject(br);
-}
-
 enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MEDIA, BTN_BACK };
 
 static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
@@ -3967,6 +4100,7 @@ static void ReorderTrack(int srcIdx, int destIdx)
     Track t = g_playlist[srcIdx];
     g_playlist.erase(g_playlist.begin() + srcIdx);
     g_playlist.insert(g_playlist.begin() + destIdx, t);
+    g_unsortedPlaylist.clear();  // order changed: sort snapshot is stale
 
     // Save scroll position so the view doesn't reset to top
     int topIdx = (int)SendMessage(hListBox, LB_GETTOPINDEX, 0, 0);
@@ -3980,6 +4114,17 @@ static void ReorderTrack(int srcIdx, int destIdx)
     }
     else {
         if (g_currentIndex >= destIdx && g_currentIndex < srcIdx) g_currentIndex++;
+    }
+
+    // The move reshuffled playlist indices: any pre-loaded "next" decode
+    // stream now belongs to the wrong index. Drop it (PreloadNext rebuilds
+    // it on the next natural track change) instead of playing the wrong file.
+    if (g_decNext) {
+        BASS_StreamFree(g_decNext);
+        g_decNext = 0;
+        g_decNextIdx = -1;
+        g_dcaDecNext = nullptr;
+        g_flacDecNext = nullptr;
     }
 
     // Rebuild listbox with star prefixes (RefreshListboxStars handles WM_SETREDRAW internally)
@@ -4028,6 +4173,17 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     if (idx == g_currentIndex) stopNeeded = true;
                     g_playlist.erase(g_playlist.begin() + idx);
                     SendMessage(hwnd, LB_DELETESTRING, idx, 0);
+                    g_unsortedPlaylist.clear();  // playlist changed: drop stale sort snapshot
+                    // Deleted indices shift the playlist: drop the pre-loaded
+                    // "next" stream, its cached index may now select the wrong
+                    // track at the gapless transition. PreloadNext rebuilds it.
+                    if (g_decNext) {
+                        BASS_StreamFree(g_decNext);
+                        g_decNext = 0;
+                        g_decNextIdx = -1;
+                        g_dcaDecNext = nullptr;
+                        g_flacDecNext = nullptr;
+                    }
                 }
             }
             if (stopNeeded) StopAudio();
@@ -4047,6 +4203,7 @@ LRESULT CALLBACK ListBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     SendMessage(hwnd, LB_INSERTSTRING, ins, (LPARAM)u.t.display);
                 }
                 g_undoRemove.clear();
+                g_unsortedPlaylist.clear();  // tracks re-inserted: sort snapshot is stale
                 RebuildShuffleOrder();
                 UpdateStatusBar();
             }
@@ -4241,13 +4398,6 @@ void ShowTrackContextMenu(HWND hwnd, int trackIdx, POINT pt)
 //  Shows: metadata (ID3 tags), format info, embedded artwork
 // ============================================================
 
-// Helper: read a BASS tag string (UTF-8 or ASCII) into wchar
-static void TagToWide(const char* tag, wchar_t* out, size_t n)
-{
-    if (!tag || !tag[0]) { wcsncpy_s(out, n, L"", _TRUNCATE); return; }
-    MultiByteToWideChar(CP_UTF8, 0, tag, -1, out, (int)n);
-}
-
 struct AudioInfoData {
     int     trackIdx;               // playlist index (-1 when opened from browser)
     wchar_t path[MAX_PATH];         // file path (always valid)
@@ -4260,19 +4410,6 @@ static wchar_t g_artExt[8] = L".jpg";
 
 static void FreeArtBytes() { if (g_artBytes) { delete[]g_artBytes; g_artBytes = NULL; g_artSize = 0; } }
 
-// Save embedded artwork to a temp file and return path
-static bool SaveArtToTemp(wchar_t* outPath, size_t n)
-{
-    if (!g_artBytes || !g_artSize) return false;
-    wchar_t tmp[MAX_PATH]; GetTempPath(MAX_PATH, tmp);
-    swprintf_s(outPath, n, L"%sbilly_cover%s", tmp, g_artExt);
-    HANDLE hf = CreateFile(outPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if (hf == INVALID_HANDLE_VALUE) return false;
-    DWORD written; WriteFile(hf, g_artBytes, g_artSize, &written, NULL);
-    CloseHandle(hf);
-    return written == g_artSize;
-}
-
 // Load artwork bitmap at a given size
 static HBITMAP LoadEmbeddedArtworkSized(HSTREAM stream, int size)
 {
@@ -4282,6 +4419,9 @@ static HBITMAP LoadEmbeddedArtworkSized(HSTREAM stream, int size)
     if (memcmp(data, "ID3", 3) != 0) return NULL;
     DWORD tagSize = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) |
         ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
+    // [中-19] BASS 不暴露该缓冲实际长度:头部声明不可全信,声明超 16MB(或为 0)直接拒解析,
+    // 防止声明值大于实际读入量时帧遍历越出缓冲(参照 LoadThumbFromID3v2 的 8MB 钳制)
+    if (tagSize == 0 || tagSize > 16 * 1024 * 1024) return NULL;
     BYTE ver = data[3];
     const BYTE* p = data + 10;
     const BYTE* end = data + 10 + tagSize;
@@ -4291,7 +4431,8 @@ static HBITMAP LoadEmbeddedArtworkSized(HSTREAM stream, int size)
         if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
         else        fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
         p += 10;
-        if (p + fsize > end) break;
+        // [中-19] 用剩余字节数值比较替代 p+fsize 指针加法,避免加法回绕漏判越界
+        if (fsize == 0 || fsize > (DWORD)(end - p)) break;
         if (strcmp(fid, "APIC") == 0 && fsize > 4) {
             const BYTE* fp = p;
             fp++;
@@ -4564,15 +4705,16 @@ static HBITMAP LoadThumbFromFLAC(FILE* f, int size)
             //                       width(4) + height(4) + depth(4) + colors(4) + dataLen(4) + data
             if (blockLen < 32) return NULL;
             DWORD mimeLen = ((DWORD)bp[4] << 24) | ((DWORD)bp[5] << 16) | ((DWORD)bp[6] << 8) | bp[7];
-            DWORD off = 8 + mimeLen;
+            uint64_t off = 8 + (uint64_t)mimeLen;
             if (off + 4 > blockLen) return NULL;
             DWORD descLen = ((DWORD)bp[off] << 24) | ((DWORD)bp[off+1] << 16) | ((DWORD)bp[off+2] << 8) | bp[off+3];
-            off += 4 + descLen;
+            off += 4 + (uint64_t)descLen;
             if (off + 20 > blockLen) return NULL;
             off += 16; // skip width, height, depth, colors
             DWORD dataLen = ((DWORD)bp[off] << 24) | ((DWORD)bp[off+1] << 16) | ((DWORD)bp[off+2] << 8) | bp[off+3];
             off += 4;
-            if (off + dataLen > blockLen || dataLen < 100) return NULL;
+            // 64-bit math: DWORD off+dataLen could wrap around and pass this check
+            if (off + (uint64_t)dataLen > blockLen || dataLen < 100) return NULL;
             return DecodeImageToThumb(bp + off, dataLen, size);
         } else {
             fseek(f, blockLen, SEEK_CUR);
@@ -4661,6 +4803,9 @@ static HBITMAP LoadThumbFromFile(const wchar_t* path, int size)
         // WAV — check for embedded ID3v2 chunk
         result = LoadThumbFromWAV(f, size);
     }
+    // [中-19] 记录实际文件长度,供下方 BASS 回退路径钳制头部声明的 tagSize
+    fseek(f, 0, SEEK_END);
+    long fileBytes = ftell(f);   // <0 = 未知(超 2GB 等),此时仅保留 16MB 上限
     fclose(f);
 
     // Fallback: use BASS to read ID3v2 tags (handles non-standard tag locations in WAV/etc.)
@@ -4674,6 +4819,11 @@ static HBITMAP LoadThumbFromFile(const wchar_t* path, int size)
                 if (memcmp(data, "ID3", 3) == 0) {
                     DWORD tagSize = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) |
                         ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
+                    // [中-19] BASS 不暴露缓冲实际长度:声明超 16MB,或整个标签放不进它所
+                    // 来自的物理文件(截断/伪造)均拒绝扫描(tagSize=0 使循环体为空)
+                    if (tagSize > 16 * 1024 * 1024 ||
+                        (fileBytes >= 10 && 10 + (ULONGLONG)tagSize > (ULONGLONG)fileBytes))
+                        tagSize = 0;
                     BYTE ver = data[3];
                     const BYTE* p = data + 10;
                     const BYTE* end = data + 10 + tagSize;
@@ -4683,7 +4833,8 @@ static HBITMAP LoadThumbFromFile(const wchar_t* path, int size)
                         if (ver >= 4) fsize = ((p[4] & 0x7F) << 21) | ((p[5] & 0x7F) << 14) | ((p[6] & 0x7F) << 7) | (p[7] & 0x7F);
                         else          fsize = (p[4] << 24) | (p[5] << 16) | (p[6] << 8) | p[7];
                         p += 10;
-                        if (fsize == 0 || p + fsize > end) break;
+                        // [中-19] 用剩余字节数值比较替代 p+fsize 指针加法,避免加法回绕漏判越界
+                        if (fsize == 0 || fsize > (DWORD)(end - p)) break;
                         if (strcmp(fid, "APIC") == 0 && fsize > 10) {
                             const BYTE* fp = p; fp++;
                             while (fp < p + fsize && *fp) fp++;
@@ -5395,6 +5546,10 @@ static void DiscogsSearch(const wchar_t* artist, const wchar_t* title, HWND hSta
     else { if (hStatus) SetWindowText(hStatus, L"请输入歌手或标题进行搜索。"); return; }
 
     std::string enc = UrlEncode(query.c_str());
+    // UrlEncode emits pure ASCII, so capping the byte length also caps the wide
+    // length: an overlong query is truncated instead of letting the conversion
+    // below fail outright (a failed conversion silently emptied the query)
+    if (enc.size() >= 512) enc.resize(511);
     wchar_t url[1024];
     // Convert encoded query to wide
     wchar_t wenc[512] = {};
@@ -6153,6 +6308,11 @@ static void RadioSearch(const wchar_t* query, const wchar_t* genre, HWND hStatus
 
     std::string encQuery = UrlEncode(query && query[0] ? query : L"");
     std::string encGenre = UrlEncode(genre && genre[0] ? genre : L"");
+    // UrlEncode emits pure ASCII, so capping the byte length also caps the wide
+    // length: overlong queries are truncated instead of letting the conversions
+    // below fail outright (a failed conversion silently dropped the query)
+    if (encQuery.size() >= 512) encQuery.resize(511);
+    if (encGenre.size() >= 256) encGenre.resize(255);
 
     wchar_t path[1024];
     wchar_t wq[512] = {}, wg[256] = {};
@@ -6266,6 +6426,9 @@ static void RadioPlayStation(int idx)
         return;
     }
 
+    // [中-18] ClearPlaylist() 从下方 Add station 处提前到此:它现在会先停播,
+    // 不能在 currentStream 已换成新电台流之后再调用(会当场停掉刚启动的电台)。
+    ClearPlaylist();
     // Use as main currentStream — DSP, volume, peak meter all work
     currentStream = stream;
     g_radioStream = stream;
@@ -6281,8 +6444,7 @@ static void RadioPlayStation(int idx)
     SetTimer(g_hwnd, IDT_PEAK_METER, 50, NULL);
     SetTimer(g_hwnd, IDT_RADIO_META, 2000, NULL); // poll metadata every 2s
 
-    // Add station to playlist view
-    ClearPlaylist();
+    // Add station to playlist view — [中-18] 列表已提前在流启动之前清空(见上)
     Track t = {};
     wcsncpy_s(t.path, rs.url, _TRUNCATE);
     _snwprintf_s(t.display, _countof(t.display), _TRUNCATE, L"\u25B6 %s", rs.name);
@@ -6706,6 +6868,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     static int     s_trackIdx = -1;
     static wchar_t s_filePath[MAX_PATH] = {};
     static bool    s_artDragging = false;
+    static HWND    s_hFmt = NULL, s_hPath = NULL; // right-column read-only boxes share IDC_STATIC, keep handles for WM_SIZE
 
     switch (msg) {
     case WM_CREATE: {
@@ -6720,13 +6883,15 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
 
-        // === Layout: 560x520 ===
+        // === Layout: computed from the actual client rect; WM_SIZE below keeps it in sync ===
         // Left col: artwork 220x220 + drag hint + Save/Replace buttons
         // Right col: format info (read-only) + editable tag fields
         // Bottom: Save Tags + Close
 
+        RECT crc; GetClientRect(hwnd, &crc);
         int artW = 220, artH = 220;
-        int lx = 10, rx = artW + 20, rw = 560 - rx - 10;
+        int lx = 10, rx = artW + 20, rw = (int)crc.right - rx - 10;
+        if (rw < 80) rw = 80;
 
         // Artwork panel
         CreateWindow(L"STATIC", NULL,
@@ -6767,6 +6932,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
             rx, ry, rw, 52, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
         SendMessage(hFmtEdit, WM_SETFONT, (WPARAM)g_fontMono, TRUE);
+        s_hFmt = hFmtEdit;
         ry += 58;
 
         // File path (read-only, full path)
@@ -6774,6 +6940,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
             rx, ry, rw, 22, hwnd, (HMENU)IDC_STATIC, hInst, NULL);
         SendMessage(hPath, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
+        s_hPath = hPath;
         ry += 30;
 
         // === Editable tag fields ===
@@ -6991,15 +7158,17 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             }
         }
 
-        // Discogs lookup button
-        int dcgY = 460;
+        // Discogs lookup button (anchored above the Save/Close row at the client bottom)
+        int chC = (int)crc.bottom;
+        int bby = chC - 28; if (bby < 10) bby = 10;
+        if (bby + 26 > chC) bby = max(0, chC - 26);
+        int dcgY = bby - 32; if (dcgY < 10) dcgY = 10;
         HWND hDiscogs = CreateWindow(L"BUTTON", L"\u2B07 标签数据库 (Discogs)",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             rx, dcgY, rw, 26, hwnd, (HMENU)ID_INFO_DISCOGS, hInst, NULL);
         SendMessage(hDiscogs, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
         // Save Tags + Close buttons at bottom
-        int bby = 492;
         HWND hSaveTags = CreateWindow(L"BUTTON", L"保存标签",
             WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             rx, bby, rw / 2 - 4, 26, hwnd, (HMENU)ID_INFO_SAVE_TAGS, hInst, NULL);
@@ -7012,6 +7181,35 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         // (close button below artwork removed)
 
+        // Trigger layout via WM_SIZE (same pattern as the search window)
+        SendMessage(hwnd, WM_SIZE, SIZE_RESTORED, MAKELPARAM(crc.right, crc.bottom));
+        break;
+    }
+
+    case WM_SIZE: {
+        // Reposition children from the actual client rect so the right column and
+        // the bottom Discogs / Save Tags / Close buttons stay inside the client area
+        RECT rc; GetClientRect(hwnd, &rc);
+        int cw = rc.right, ch = rc.bottom;
+        int artW = 220, rx = artW + 20;
+        int rw = cw - rx - 10; if (rw < 80) rw = 80;
+        if (s_hFmt)  MoveWindow(s_hFmt,  rx, 10, rw, 52, TRUE);
+        if (s_hPath) MoveWindow(s_hPath, rx, 68, rw, 22, TRUE);
+        int ry = 98; // right-column y continues after format info (10+58) and path (68+30)
+        for (int id = ID_INFO_TITLE; id <= ID_INFO_GENRE; ++id) {
+            HWND hEd = GetDlgItem(hwnd, id);
+            if (hEd) MoveWindow(hEd, rx + 64, ry, rw - 64, 22, TRUE);
+            ry += 28;
+        }
+        int bby = ch - 28; if (bby < 10) bby = 10;
+        if (bby + 26 > ch) bby = max(0, ch - 26);
+        int dcgY = bby - 32; if (dcgY < 10) dcgY = 10;
+        HWND hDiscogs = GetDlgItem(hwnd, ID_INFO_DISCOGS);
+        if (hDiscogs) MoveWindow(hDiscogs, rx, dcgY, rw, 26, TRUE);
+        HWND hSaveTags = GetDlgItem(hwnd, ID_INFO_SAVE_TAGS);
+        if (hSaveTags) MoveWindow(hSaveTags, rx, bby, rw / 2 - 4, 26, TRUE);
+        HWND hClose = GetDlgItem(hwnd, ID_INFO_CLOSE);
+        if (hClose) MoveWindow(hClose, rx + rw / 2 + 4, bby, rw / 2 - 4, 26, TRUE);
         break;
     }
 
@@ -7752,6 +7950,20 @@ static void SmtcCleanup()
 static HWND s_optPanels[4] = {};
 static int  s_optPage = 0;
 
+// [L-13] 选项面板子控件的滚轮最小子类化:面板内容可滚(si.nMax>0)时把 WM_MOUSEWHEEL
+// 转给面板滚动;不可滚时走默认处理,不干扰滑块/编辑框自身的滚轮行为
+static LRESULT CALLBACK OptChildWheelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                          UINT_PTR, DWORD_PTR)
+{
+    if (msg == WM_MOUSEWHEEL && GetParent(hwnd)) {
+        HWND hp = GetParent(hwnd);
+        SCROLLINFO si = { sizeof(si), SIF_ALL };
+        if (GetScrollInfo(hp, SB_VERT, &si) && si.nMax > 0)
+            return SendMessage(hp, WM_MOUSEWHEEL, wp, lp);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -7780,7 +7992,45 @@ static LRESULT CALLBACK OptPanelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SCROLLINFO si = { sizeof(si), SIF_RANGE | SIF_PAGE,
                 0, (int)max(0, maxBottom - (int)crc.bottom), (UINT)max(1, (int)crc.bottom) };
             SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
-            ShowScrollBar(hwnd, SB_VERT, maxBottom > (int)crc.bottom);
+            // [L-12] 滚动条出现/消失使客户区缩窄/还原:按新客户区宽度校正右缘控件
+            bool showBar = maxBottom > (int)crc.bottom;
+            bool wasBar  = (GetWindowLongPtr(hwnd, GWLP_USERDATA) & 1) != 0;
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, showBar ? 1 : 0);
+            ShowScrollBar(hwnd, SB_VERT, showBar);
+            if (showBar != wasBar) {
+                GetClientRect(hwnd, &crc);
+                int fitRight = (int)crc.right - 4;   // 与页面布局一致的 4px 右边距
+                for (HWND hc = GetWindow(hwnd, GW_CHILD); hc; hc = GetWindow(hc, GW_HWNDNEXT)) {
+                    RECT rc; GetWindowRect(hc, &rc);
+                    POINT tl = { rc.left, rc.top };
+                    ScreenToClient(hwnd, &tl);
+                    int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+                    if (showBar) {
+                        // 首次缩窄:记录原始宽度,越出右界的控件钳到 fitRight
+                        if (!GetProp(hc, L"BillyOptFullW"))
+                            SetProp(hc, L"BillyOptFullW", (HANDLE)(INT_PTR)cw);
+                        if (tl.x < fitRight && tl.x + cw > fitRight)
+                            SetWindowPos(hc, NULL, 0, 0, fitRight - tl.x, ch,
+                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    } else {
+                        // 还原:恢复记录的原始宽度并清除标记
+                        HANDLE hw = GetProp(hc, L"BillyOptFullW");
+                        if (hw) {
+                            RemoveProp(hc, L"BillyOptFullW");
+                            SetWindowPos(hc, NULL, 0, 0, (int)(INT_PTR)hw, ch,
+                                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                        }
+                    }
+                }
+                InvalidateRect(hwnd, NULL, TRUE);
+            }
+            // [L-13] 子控件不转发滚轮:做一次性最小子类化,把 WM_MOUSEWHEEL 上交面板
+            for (HWND hc = GetWindow(hwnd, GW_CHILD); hc; hc = GetWindow(hc, GW_HWNDNEXT)) {
+                if (!GetProp(hc, L"BillyOptWheelHook")) {
+                    SetWindowSubclass(hc, OptChildWheelProc, 1, 0);
+                    SetProp(hc, L"BillyOptWheelHook", (HANDLE)1);
+                }
+            }
         }
         break;
     }
@@ -7842,7 +8092,7 @@ static void OptSwitchPage(int page)
 
 static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    // Layout constants (client area 490 x 380)
+    // Layout constants (client area 490 x 548)
     static const int CL_W  = 490;
     static const int CL_H  = 548;
     static const int SB_W  = 130;   // sidebar width
@@ -8107,7 +8357,7 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             HWND hSlider = CreateWindow(TRACKBAR_CLASS, NULL,
                 WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS | WS_TABSTOP,
                 10, 54, w - 90, 28, p, (HMENU)ID_OPT_PITCH_SLIDER, hInst, NULL);
-            SendMessage(hSlider, TBM_SETRANGE, TRUE, MAKELONG(-120, 120));
+            SendMessage(hSlider, TBM_SETRANGE, TRUE, MAKELPARAM(-120, 120));   // [L-14] 范围走 LPARAM 低/高位,用 MAKELPARAM 明确位布局
             SendMessage(hSlider, TBM_SETTICFREQ, 10, 0);  // tick every 1 semitone
             SendMessage(hSlider, TBM_SETPAGESIZE, 0, 10); // PgUp/Dn = 1 semitone
             SendMessage(hSlider, TBM_SETPOS, TRUE, sliderVal);
@@ -8116,12 +8366,12 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             wchar_t pbuf[16]; swprintf_s(pbuf, L"%.1f", g_pitchSemitones);
             edt(p, w - 74, 56, 64, 22, ID_OPT_PITCH_VALUE, pbuf);
 
-            // Tick labels aligned under the slider ends / midpoint
+            // Tick labels centered under the thumb travel (ends inset ~8px for thumb half-width) [L-14]
             {
                 int sx = 10, sw = w - 90;
-                lbl(p, sx,            88, 30, 14, L"-12");
-                lbl(p, sx + sw/2 - 8, 88, 16, 14, L"0");
-                lbl(p, sx + sw - 30,  88, 30, 14, L"+12");
+                lbl(p, sx - 2,        88, 30, 14, L"-12");
+                lbl(p, sx + sw/2 - 4, 88, 16, 14, L"0");
+                lbl(p, sx + sw - 18,  88, 30, 14, L"+12");
             }
 
             // Explanation — one short line per label, no wrapping overlap
@@ -8144,10 +8394,15 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             HWND hSlider = GetDlgItem(s_optPanels[3], ID_OPT_PITCH_SLIDER);
             if (hEdit && hSlider) {
                 wchar_t buf[16] = {}; GetWindowText(hEdit, buf, 16);
-                float v = max(-12.0f, min(12.0f, (float)_wtof(buf)));
-                int newPos = (int)roundf(v * 10.0f);
-                if ((int)SendMessage(hSlider, TBM_GETPOS, 0, 0) != newPos)
-                    SendMessage(hSlider, TBM_SETPOS, TRUE, newPos);
+                // [L-15] 空串/非数字开头时不同步(滑块不再瞬跳 0);有数字则按 ±12 实时钳制
+                wchar_t* end = NULL;
+                double d = wcstod(buf, &end);
+                if (end && end != buf) {
+                    float v = max(-12.0f, min(12.0f, (float)d));
+                    int newPos = (int)roundf(v * 10.0f);
+                    if ((int)SendMessage(hSlider, TBM_GETPOS, 0, 0) != newPos)
+                        SendMessage(hSlider, TBM_SETPOS, TRUE, newPos);
+                }
             }
         }
         switch (LOWORD(wParam)) {
@@ -8207,7 +8462,15 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             StopAudio();
             // Switch device
             BASS_Free();
-            if (BASS_Init(devIdx, 44100, 0, g_hwnd, NULL)) {
+            bool initOk = BASS_Init(devIdx, 44100, 0, g_hwnd, NULL);
+            if (!initOk && BASS_ErrorGetCode() == BASS_ERROR_ALREADY) {
+                // [L-3] 设备已被本进程初始化(如麦克风输出已占用虚拟声卡):校验可用后直接切上下文使用
+                BASS_DEVICEINFO di = {};
+                if ((BASS_GetDeviceInfo(devIdx, &di) && (di.flags & BASS_DEVICE_ENABLED))
+                    && BASS_SetDevice(devIdx))
+                    initOk = true;
+            }
+            if (initOk) {
                 wchar_t dn[256] = L"";
                 SendMessage(hCombo, CB_GETLBTEXT, sel, (LPARAM)dn);
                 wcsncpy_s(g_outDeviceName, dn, _TRUNCATE);   // 记录主输出选择
@@ -8254,8 +8517,21 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             g_multiInst  = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_MULTIINST),    BM_GETCHECK,0,0)==BST_CHECKED);
             g_dropAppend = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_DROP_APPEND),  BM_GETCHECK,0,0)==BST_CHECKED);
             g_dropLoadDir = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_DROP_LOADDIR), BM_GETCHECK,0,0)==BST_CHECKED);
-            { wchar_t sb[16]; GetDlgItemText(s_optPanels[0], ID_OPT_SEEK_STEP, sb, 16);
-              float sv = (float)_wtof(sb); if (sv >= 1.0f) g_seekStep = sv; }
+            {   // [L-15] 快进步长保存校验:空/非数字/小于 1 秒时提示并保留原值
+                wchar_t sb[16]; GetDlgItemText(s_optPanels[0], ID_OPT_SEEK_STEP, sb, 16);
+                wchar_t* end = NULL;
+                double d = wcstod(sb, &end);
+                while (end && *end == L' ') end++;
+                bool ok = (end && end != sb && *end == 0);
+                if (!ok || d < 1.0) {
+                    MessageBox(hwnd, L"快进步长无效：请输入不小于 1 的数字（秒），已保留原值。",
+                        L"BillyPro", MB_OK | MB_ICONWARNING);
+                    wchar_t ob[16]; swprintf_s(ob, L"%.0f", g_seekStep);
+                    SetDlgItemText(s_optPanels[0], ID_OPT_SEEK_STEP, ob);
+                } else {
+                    g_seekStep = (float)d;
+                }
+            }
             // Remember session
             g_rememberSession = (SendMessage(GetDlgItem(s_optPanels[0], ID_OPT_SESSION_TRACK), BM_GETCHECK,0,0)==BST_CHECKED) ? 1 : 0;
             // Microphone output
@@ -8280,8 +8556,24 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                 bool wasPitch = g_pitchEnabled;
                 float wasAmt  = g_pitchSemitones;
                 g_pitchEnabled = (SendMessage(GetDlgItem(s_optPanels[3], ID_OPT_PITCH_ENABLE), BM_GETCHECK,0,0)==BST_CHECKED);
+                // [L-15] 音调数值保存校验:空/非数字时提示并保留原值;合法值钳到 ±12 并回写
                 wchar_t pbuf[16]; GetWindowText(GetDlgItem(s_optPanels[3], ID_OPT_PITCH_VALUE), pbuf, 16);
-                g_pitchSemitones = max(-12.0f, min(12.0f, (float)_wtof(pbuf)));
+                wchar_t* pend = NULL;
+                double pd = wcstod(pbuf, &pend);
+                while (pend && *pend == L' ') pend++;
+                bool pok = (pend && pend != pbuf && *pend == 0);
+                if (!pok) {
+                    MessageBox(hwnd, L"音调数值无效：请输入 -12 到 +12 之间的数字，已保留原值。",
+                        L"BillyPro", MB_OK | MB_ICONWARNING);
+                    swprintf_s(pbuf, L"%.1f", g_pitchSemitones);
+                    SetWindowText(GetDlgItem(s_optPanels[3], ID_OPT_PITCH_VALUE), pbuf);
+                } else {
+                    g_pitchSemitones = max(-12.0f, min(12.0f, (float)pd));
+                    if (g_pitchSemitones != (float)pd) {   // 超出 ±12 的输入:回写钳制后的值
+                        swprintf_s(pbuf, L"%.1f", g_pitchSemitones);
+                        SetWindowText(GetDlgItem(s_optPanels[3], ID_OPT_PITCH_VALUE), pbuf);
+                    }
+                }
                 if (wasPitch != g_pitchEnabled || wasAmt != g_pitchSemitones) ApplyPitch();
             }
             if (g_darkMode != wasDark) ApplyTheme();
@@ -8297,7 +8589,15 @@ static LRESULT CALLBACK OptionsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
                         bool wasPlaying = currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING;
                         StopAudio();
                         BASS_Free();
-                        if (BASS_Init(devIdx, 44100, 0, g_hwnd, NULL)) {
+                        bool initOk = BASS_Init(devIdx, 44100, 0, g_hwnd, NULL);
+                        if (!initOk && BASS_ErrorGetCode() == BASS_ERROR_ALREADY) {
+                            // [L-3] 设备已被本进程初始化:校验可用后直接切上下文使用
+                            BASS_DEVICEINFO di = {};
+                            if ((BASS_GetDeviceInfo(devIdx, &di) && (di.flags & BASS_DEVICE_ENABLED))
+                                && BASS_SetDevice(devIdx))
+                                initOk = true;
+                        }
+                        if (initOk) {
                             wchar_t dn[256] = L"";
                             SendMessage(hCombo, CB_GETLBTEXT, sel, (LPARAM)dn);
                             wcsncpy_s(g_outDeviceName, dn, _TRUNCATE);   // 持久化主输出选择
@@ -8497,6 +8797,7 @@ static void SearchDeleteSelected()
     g_playlist.erase(g_playlist.begin() + playlistIdx);
     SendMessage(hListBox, LB_DELETESTRING, playlistIdx, 0);
     if (wasPlaying) StopAudio();
+    g_unsortedPlaylist.clear();  // playlist changed: drop stale sort snapshot
     RebuildShuffleOrder();
     g_currentIndex = min(g_currentIndex, (int)g_playlist.size() - 1);
     if (!g_playlist.empty())
@@ -8572,13 +8873,13 @@ LRESULT CALLBACK SearchWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         RECT rc; GetClientRect(hwnd, &rc);
         int cw = rc.right, ch = rc.bottom;
         if (hSearchEdit) MoveWindow(hSearchEdit, 8, 8, cw - 16, 26, TRUE);
-        if (hSearchList) MoveWindow(hSearchList, 8, 42, cw - 16, ch - 42 - 46, TRUE);
+        if (hSearchList) MoveWindow(hSearchList, 8, 42, cw - 16, max(0, ch - 42 - 46), TRUE);
         HWND hOK   = GetDlgItem(hwnd, ID_SEARCH_OK);
         HWND hSave = GetDlgItem(hwnd, ID_SEARCH_SAVEPL);
         HWND hCan  = GetDlgItem(hwnd, ID_SEARCH_CANCEL);
         int bh = 28, by = ch - 38;
         int totalW = 88 + 120 + 88 + 16; // 3 buttons + gaps
-        int bx = (cw - totalW) / 2;
+        int bx = max(0, (cw - totalW) / 2);
         if (hOK)   MoveWindow(hOK,   bx, by, 88, bh, TRUE); bx += 92;
         if (hSave) MoveWindow(hSave, bx, by, 120, bh, TRUE); bx += 124;
         if (hCan)  MoveWindow(hCan,  bx, by, 88, bh, TRUE);
@@ -9099,8 +9400,8 @@ static int GetColumnRects(RECT listRc, RECT* colRects, int* colIDs, int maxCols)
         HDITEM hdi = {}; hdi.mask = HDI_WIDTH | HDI_LPARAM;
         Header_GetItem(hColumnHeader, i, &hdi);
         colRects[i] = listRc;
-        colRects[i].left = x;
-        colRects[i].right = x + hdi.cxy;
+        colRects[i].left = min(x, listRc.right);              // [L-17] 列总和超宽:越界列钳为空矩形
+        colRects[i].right = min(x + hdi.cxy, listRc.right);   // 不越过列表右缘
         colIDs[i] = (int)hdi.lParam;
         x += hdi.cxy;
     }
@@ -9330,6 +9631,16 @@ static void SortPlaylistByColumn(int colId, bool ascending)
             int cmp = _wcsicmp(ta, tb);
             return ascending ? (cmp < 0) : (cmp > 0);
         });
+    // Sorting reshuffles playlist indices: drop any pre-loaded "next" decode
+    // stream whose cached index now refers to another track (PreloadNext
+    // rebuilds it on the next natural track change).
+    if (g_decNext) {
+        BASS_StreamFree(g_decNext);
+        g_decNext = 0;
+        g_decNextIdx = -1;
+        g_dcaDecNext = nullptr;
+        g_flacDecNext = nullptr;
+    }
     RebuildListboxAfterSort(curPath);
 }
 
@@ -9450,15 +9761,33 @@ void LayoutControls(HWND hwnd)
     // Back button: to the left of Library, only when browser is active
     if (hMediaBtn) {
         if (!g_mediaFolders.empty()) {
+            // [中-20] Row-1's fixed segment ends at row1Right (repeat button) while the
+            // Library/Back buttons are placed back from rc.right; on a very narrow client
+            // the two groups would overlap or the right group would land at a negative x.
+            // Hide by priority instead: Back first (transient navigation aid), then Library.
+            // Thresholds are conservative — an 8px gap is always kept between the groups
+            // (showMedia needs client width >= ~262px, showBack >= ~282px; the [L-11]
+            // minimum window width of 520 leaves ~500px client, so both stay visible).
+            int row1Right = sbx + 50 + 46;  // right edge of repeat button (fixed x = 196)
+            const int kRow1Gap = 8;         // min gap kept between the two groups
             int libX = rc.right - vw - 4 - 42;
-            if (hBackBtn && (g_browserActive || g_browserReturn)) {
-                MoveWindow(hBackBtn, libX - 20, y, 18, bh, TRUE);
-                ShowWindow(hBackBtn, SW_SHOW);
-            } else if (hBackBtn) {
-                ShowWindow(hBackBtn, SW_HIDE);
+            bool showMedia = (libX >= row1Right + kRow1Gap);         // client width >= ~262
+            bool showBack  = showMedia && (g_browserActive || g_browserReturn)
+                             && (libX - 20 >= row1Right + kRow1Gap); // client width >= ~282
+            if (hBackBtn) {
+                if (showBack) {
+                    MoveWindow(hBackBtn, libX - 20, y, 18, bh, TRUE);
+                    ShowWindow(hBackBtn, SW_SHOW);
+                } else {
+                    ShowWindow(hBackBtn, SW_HIDE);
+                }
             }
-            MoveWindow(hMediaBtn, libX, y, 42, bh, TRUE);
-            ShowWindow(hMediaBtn, SW_SHOW);
+            if (showMedia) {
+                MoveWindow(hMediaBtn, libX, y, 42, bh, TRUE);
+                ShowWindow(hMediaBtn, SW_SHOW);
+            } else {
+                ShowWindow(hMediaBtn, SW_HIDE);
+            }
         } else {
             ShowWindow(hMediaBtn, SW_HIDE);
             if (hBackBtn) ShowWindow(hBackBtn, SW_HIDE);
@@ -9592,10 +9921,10 @@ void RegisterCustomClasses(HINSTANCE hInst)
 // ============================================================
 bool HandleGlobalKey(WPARAM vk)
 {
-    // Don't intercept when typing in search edit
+    // Don't intercept when the search window or any child has focus
     if (g_hwndSearch && IsWindow(g_hwndSearch)) {
         HWND focused = GetFocus();
-        if (focused == hSearchEdit) return false;
+        if (focused == g_hwndSearch || IsChild(g_hwndSearch, focused)) return false;
     }
 
     switch (vk) {
@@ -9873,13 +10202,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             RecreateListbox();
         }
 
-        // Register global media key hotkeys
+        // Register global media key hotkeys. [L-4] Return values deliberately not
+        // checked: these four VKs are often held by browsers/other players, and a
+        // startup popup per key would be noise -- while a key is held elsewhere the
+        // built-in play control simply does not fire.
         RegisterHotKey(hwnd, ID_HOTKEY_PLAYPAUSE, 0, VK_MEDIA_PLAY_PAUSE);
         RegisterHotKey(hwnd, ID_HOTKEY_NEXT,      0, VK_MEDIA_NEXT_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_PREV,      0, VK_MEDIA_PREV_TRACK);
         RegisterHotKey(hwnd, ID_HOTKEY_STOP,      0, VK_MEDIA_STOP);
         // Raw Input keyboard: global sound/fn hotkeys fire even under IME (Vanguard-safe)
-        RegisterRawKeyboard(hwnd);
+        // [L-8] One-shot prompt (same pattern as the BASS_Init failure above): without
+        // raw input every global sound/fn hotkey fails silently for the whole run.
+        if (!RegisterRawKeyboard(hwnd))
+            MessageBox(hwnd, L"注册全局键盘监听失败（Raw Input 不可用），本次运行中全局热键不会生效。",
+                L"热键", MB_ICONWARNING);
 
         // Resolve the mic-output (virtual cable) device at startup
         MicOutStartupResolve();
@@ -9897,6 +10233,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // Initialize SMTC (System Media Transport Controls — lock screen / media overlay)
         SmtcInit(hwnd);
         break;
+    }
+
+    case WM_GETMINMAXINFO: {
+        // [L-11] Enforce a minimum window size so the fixed-coordinate layouts in
+        // LayoutControls never overlap or go negative: Row-1 buttons + Library/Back
+        // need ~282px client width, the seek bar / status-bar parts need ~200px
+        // (thresholds coordinated with the [中-20] clamps); 520x360 outer size leaves
+        // ~500px client width at 96 DPI — above every threshold in LayoutControls.
+        MINMAXINFO* mmi = (MINMAXINFO*)lParam;
+        mmi->ptMinTrackSize.x = 520;  // client ~500px: covers Row-1 (196) + gap + right group (~282 needed)
+        mmi->ptMinTrackSize.y = 360;  // keeps playlist height positive and above the status bar
+        return 0;
     }
 
     case WM_SIZE:
@@ -10283,7 +10631,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case MICOUT_WM_TAPLOST:
         // Virtual cable vanished mid-playback — drop the tap, speaker keeps playing
         MicOutStopTap();
-        g_micOutDev = -1;
+        MicOutReleaseDevice();   // [中-1] BASS_Free 死设备槽(prevCtx 保存/恢复+排除主输出),清掉 BASS_DEVICE_INIT 残留,同索引重挂不再被 INIT 短路
+        break;
+
+    case MICOUT_WM_DEVFAIL:   // [中-2] the cable-hosted mode-0 master's device failed
+        // The device failure frees the streams that lived on it, so drop the
+        // possibly-dangling master pointer first; StopAudio then resets the
+        // timers/radio/UI state and frees the (not device-bound) decode streams.
+        currentStream = 0;
+        StopAudio();
+        MicOutReleaseDevice();   // clear the dead device slot, same as TAPLOST
+        if (g_micOutEnabled && g_hwnd && !g_micOutDevFailShown) {
+            g_micOutDevFailShown = true;
+            MessageBox(hwnd,
+                L"虚拟声卡（VB-CABLE）已失效或被移除，播放已停止。\n\n"
+                L"重新连接虚拟声卡后重新播放即可恢复。",
+                L"麦克风输出", MB_OK | MB_ICONWARNING);
+        }
         break;
 
     case MICOUT_WM_STARTHINT:
@@ -10481,14 +10845,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         switch (wParam) {
         case VK_RIGHT:
             if (currentStream && !g_seekKeyHeld) {
-                SeekToSeconds(GetPlayPos() + g_seekStep);
+                SeekToSeconds(GetPlayPos() + g_seekStep, true);
                 g_seekKeyHeld = true; g_seekKeyDir = +1; g_seekRepeatCount = 0;
                 SetTimer(hwnd, IDT_SEEK_REPEAT, 350, NULL);
             }
             break;
         case VK_LEFT:
             if (currentStream && !g_seekKeyHeld) {
-                SeekToSeconds(GetPlayPos() - g_seekStep);
+                SeekToSeconds(GetPlayPos() - g_seekStep, true);
                 g_seekKeyHeld = true; g_seekKeyDir = -1; g_seekRepeatCount = 0;
                 SetTimer(hwnd, IDT_SEEK_REPEAT, 350, NULL);
             }
@@ -10508,6 +10872,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_ACTIVATE:
+        RiClearKeyStates();   // heal ghost modifiers after UAC/lock-screen (lost BREAKs)
         if (LOWORD(wParam) != WA_INACTIVE && hListBox) {
             // Don't steal focus from child dialogs (search, options, etc.)
             bool childActive = (g_hwndSearch && IsWindow(g_hwndSearch)) ||
@@ -10603,6 +10968,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 g_browserItems.clear();
                 // Restore saved playlist to listbox without stopping playback
                 g_playlist = g_savedPlaylist;
+                g_unsortedPlaylist.clear();  // playlist swapped back: sort snapshot may be stale
                 g_savedPlaylist.clear();
                 g_currentIndex = -1;  // position in restored playlist is unknown
                 SendMessage(hListBox, LB_RESETCONTENT, 0, 0);
@@ -10662,6 +11028,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     if (idx == g_currentIndex) stopNeeded = true;
                     g_playlist.erase(g_playlist.begin() + idx);
                     SendMessage(hListBox, LB_DELETESTRING, idx, 0);
+                    g_unsortedPlaylist.clear();  // playlist changed: drop stale sort snapshot
+                    // Deleted indices shift the playlist: drop the pre-loaded
+                    // "next" stream, its cached index may now select the wrong
+                    // track at the gapless transition. PreloadNext rebuilds it.
+                    if (g_decNext) {
+                        BASS_StreamFree(g_decNext);
+                        g_decNext = 0;
+                        g_decNextIdx = -1;
+                        g_dcaDecNext = nullptr;
+                        g_flacDecNext = nullptr;
+                    }
                 }
             }
             if (stopNeeded) StopAudio();
@@ -10786,6 +11163,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_PLAYNEXT:
+        // Consume the decode stream the mixing thread set aside. GaplessProc
+        // defers the BASS_StreamFree to the UI thread via g_decOldToFree, which
+        // previously was never consumed — a one-decode-stream-per-track leak.
+        if (g_decOldToFree) { BASS_StreamFree(g_decOldToFree); g_decOldToFree = 0; }
         if (wParam == 1) {
             // Gapless transition: GaplessProc already swapped decode streams
             // Activate DTS decoder for the new track (if it's DTS)
@@ -10832,7 +11213,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             // g_decNext still holds the pre-loaded decode stream.
             // Stop the current master and do a full PlayIndex using g_decNext.
             MicOutStopTap();
-            if (currentStream) { BASS_StreamFree(currentStream); currentStream = 0; }
+            // Halt GaplessProc before tearing the master down — same flag StopAudio
+            // raises: BASS_ChannelStop/ChannelLock cannot fence a mixing round that
+            // is already in flight, the flag makes it output silence and leave the
+            // decode streams alone. Cleared once the rebuilt master plays below.
+            InterlockedExchange(&g_gaplessHalt, 1);
+            if (currentStream) {
+                BASS_ChannelStop(currentStream);
+                BASS_StreamFree(currentStream);
+                currentStream = 0;
+            }
             // g_decStream already cleared by GaplessProc
             int nextIdx = g_decNextIdx;
             g_decNextIdx = -1;
@@ -10877,7 +11267,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     ApplyPitch();
                     UpdateVolume();
                     MicOutMaybeAttachTap();
-                    BASS_ChannelPlay(currentStream, FALSE);
+                    MicOutArmDevFailSync();   // [中-2] mode 0: rebuilt master — re-arm the device-fail watch
+                    if (BASS_ChannelPlay(currentStream, FALSE))
+                        InterlockedExchange(&g_gaplessHalt, 0);   // rebuilt master live — re-enable GaplessProc
+                    else
+                        InterlockedExchange(&g_gaplessHalt, 0);   // play failed — nothing mixes on the new master; unstick the halt or a later resume would stay silent
                     SetTimer(g_hwnd, IDT_PLAYBACK, 16, NULL);
                 }
                 if (g_hwnd) LayoutControls(g_hwnd);
@@ -10887,6 +11281,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (hSeekCanvas) InvalidateRect(hSeekCanvas, NULL, FALSE);
                 if (hVolumeCanvas) InvalidateRect(hVolumeCanvas, NULL, FALSE);
                 PreloadNext();
+            }
+            else {
+                // nextIdx stale (playlist shrank or was cleared between the preload
+                // and this message): release the stalled preloads instead of leaking
+                // them — same teardown StopAudio applies to the decode state.
+                if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
+                g_dcaDecNext = nullptr;
+                g_flacDecNext = nullptr;
             }
         }
         else {
@@ -10946,13 +11348,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         RemoveTrayIcon();
         KillTimer(g_hwnd, IDT_PLAYBACK);
         KillTimer(g_hwnd, IDT_SEEK_REPEAT);
+        if (g_hwndDiscogs && IsWindow(g_hwndDiscogs)) DestroyWindow(g_hwndDiscogs);
         if (g_hwndSearch && IsWindow(g_hwndSearch))   DestroyWindow(g_hwndSearch);
         if (g_hwndInfo && IsWindow(g_hwndInfo))        DestroyWindow(g_hwndInfo);
         if (g_hwndAssoc && IsWindow(g_hwndAssoc))      DestroyWindow(g_hwndAssoc);
         FreeArtBytes();
+        // The modeless Discogs dialog owns g_dcgPreviewBmp; its own WM_DESTROY
+        // clears it, and this backstop ensures the bitmap can never leak at exit
+        if (g_dcgPreviewBmp) { DeleteObject(g_dcgPreviewBmp); g_dcgPreviewBmp = NULL; }
         DragAcceptFiles(hwnd, FALSE);
         if (g_decNext) { BASS_StreamFree(g_decNext); g_decNext = 0; }
         if (g_decStream) { BASS_StreamFree(g_decStream); g_decStream = 0; }
+        if (g_decOldToFree) { BASS_StreamFree(g_decOldToFree); g_decOldToFree = 0; }
         if (currentStream) { BASS_ChannelStop(currentStream); BASS_StreamFree(currentStream); }
         MicOutShutdown();   // free the mic-output tap and the cable device
         BASS_Free();
@@ -11243,7 +11650,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
             HWND focusWnd = GetFocus();
             // Don't steal keys when any dialog (info, options, convert) or search has focus
             bool searchFocused = (g_hwndSearch && IsWindow(g_hwndSearch) &&
-                focusWnd == hSearchEdit);
+                (focusWnd == g_hwndSearch || IsChild(g_hwndSearch, focusWnd)));
             bool dialogFocused =
                 (g_hwndInfo    && IsWindow(g_hwndInfo)    && (focusWnd == g_hwndInfo    || IsChild(g_hwndInfo,    focusWnd))) ||
                 (g_hwndOptions && IsWindow(g_hwndOptions) && (focusWnd == g_hwndOptions || IsChild(g_hwndOptions, focusWnd))) ||
