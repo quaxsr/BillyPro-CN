@@ -66,8 +66,6 @@ extern "C" {
 #define ID_BTN_PLAYPAUSE    103
 #define ID_BTN_PAUSE        116
 #define ID_BTN_STOP         104
-#define ID_BTN_PREV         109
-#define ID_BTN_NEXT         110
 #define ID_VOLUMECANVAS     105
 #define ID_VOL_PCT          112
 #define ID_SEEKCANVAS       106
@@ -239,11 +237,9 @@ HWND hListBox = NULL;
 HWND hColumnHeader = NULL; // column header bar for column view
 bool g_columnView = false; // column view enabled
 bool g_rememberColumns = true; // persist column layout across sessions
-HWND hPrevBtn = NULL;
 HWND hPlayBtn = NULL;
 HWND hPauseBtn = NULL;
 HWND hStopBtn = NULL;
-HWND hNextBtn = NULL;
 HWND hShuffleBtn = NULL;
 HWND hRepeatBtn = NULL;
 HWND hMediaBtn     = NULL;
@@ -367,13 +363,11 @@ bool   g_dropLoadDir  = false;   // when dropping a file, load its entire parent
 HWND   g_hwndAssoc    = NULL;    // file associations dialog
 HWND   g_hwndOptions  = NULL;    // options dialog
 
-// Taskbar thumbnail toolbar (play/pause/skip controls)
+// Taskbar thumbnail toolbar (play/pause control)
 static ITaskbarList3* g_pTaskbar          = NULL;
-static HICON          g_thumbIcons[4]     = {};  // 0=prev, 1=play, 2=pause, 3=next
+static HICON          g_thumbIcons[2]     = {};  // 0=play, 1=pause
 static UINT           g_WM_TASKBARBUTTONCREATED = 0;
-#define THUMB_BTN_PREV   0
-#define THUMB_BTN_PLAY   1
-#define THUMB_BTN_NEXT   2
+#define THUMB_BTN_PLAY   0
 
 // SMTC (System Media Transport Controls)
 static winrt::Windows::Media::SystemMediaTransportControls g_smtc{ nullptr };
@@ -2708,8 +2702,6 @@ void UpdatePlayBtn()
     if (hPlayBtn)  InvalidateRect(hPlayBtn, NULL, TRUE);
     if (hPauseBtn) InvalidateRect(hPauseBtn, NULL, TRUE);
     if (hStopBtn)  InvalidateRect(hStopBtn, NULL, TRUE);
-    if (hPrevBtn) InvalidateRect(hPrevBtn, NULL, TRUE);
-    if (hNextBtn) InvalidateRect(hNextBtn, NULL, TRUE);
 }
 
 void UpdateWindowTitle()
@@ -3575,8 +3567,6 @@ void ShowTrayContextMenu(HWND hwnd)
     AppendMenu(hMenu, MF_STRING, ID_TRAY_RESTORE, L"恢复 BillyPro");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, IDM_PLAY_PLAYPAUSE, L"播放 / 暂停");
-    AppendMenu(hMenu, MF_STRING, IDM_PLAY_NEXT, L"下一首");
-    AppendMenu(hMenu, MF_STRING, IDM_PLAY_PREV, L"上一首");
     AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hMenu, MF_STRING, ID_TRAY_EXIT, L"退出");
     SetForegroundWindow(hwnd); // required for menu to dismiss properly
@@ -3929,7 +3919,7 @@ LRESULT CALLBACK VolBarProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // ============================================================
 //  Transport buttons (GDI polygon drawing)
 // ============================================================
-enum BtnType { BTN_PREV, BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_NEXT, BTN_SHUFFLE, BTN_REPEAT, BTN_MEDIA, BTN_BACK };
+enum BtnType { BTN_PLAY, BTN_PAUSE, BTN_STOP, BTN_SHUFFLE, BTN_REPEAT, BTN_MEDIA, BTN_BACK };
 
 static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
 {
@@ -3958,18 +3948,6 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
     int u = max(1, h / 4);     // horizontal unit: 1 at the legacy 15px size
 
     switch (type) {
-    case BTN_PREV: {
-        // |< : thin bar, gap, slim triangle pointing left
-        RECT bar = { cx - 5 * u, cy - h, cx - 4 * u, cy + h + 1 };
-        HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &bar, b); DeleteObject(b);
-        // slim triangle: narrow width relative to height
-        POINT p[3] = { {cx + 2 * u,cy - h},{cx + 2 * u,cy + h},{cx - 2 * u,cy} };
-        HBRUSH tb = CreateSolidBrush(sym); HPEN tp = CreatePen(PS_SOLID, 1, sym);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, tb); HPEN op = (HPEN)SelectObject(dc, tp);
-        Polygon(dc, p, 3);
-        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(tb); DeleteObject(tp);
-        break;
-    }
     case BTN_PLAY: {
         // Same size as other symbols - simple right triangle, h=4 like rest
         POINT p[3] = { {cx - 3 * u, cy - h}, {cx - 3 * u, cy + h}, {cx + h, cy} };
@@ -3988,17 +3966,6 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
     case BTN_STOP:
     { RECT sq = { cx - h, cy - h, cx + h, cy + h + 1 }; HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &sq, b); DeleteObject(b); }
     break;
-    case BTN_NEXT: {
-        // >| : slim triangle pointing right, gap, thin bar
-        POINT p[3] = { {cx - 2 * u,cy - h},{cx - 2 * u,cy + h},{cx + 2 * u,cy} };
-        HBRUSH tb = CreateSolidBrush(sym); HPEN tp = CreatePen(PS_SOLID, 1, sym);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, tb); HPEN op = (HPEN)SelectObject(dc, tp);
-        Polygon(dc, p, 3);
-        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(tb); DeleteObject(tp);
-        RECT bar = { cx + 4 * u, cy - h, cx + 5 * u, cy + h + 1 };
-        HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &bar, b); DeleteObject(b);
-        break;
-    }
     case BTN_SHUFFLE:
     case BTN_REPEAT:
     case BTN_MEDIA:
@@ -4054,8 +4021,6 @@ LRESULT CALLBACK BtnHotProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (hwnd == hPlayBtn)       fn = 0;
         else if (hwnd == hPauseBtn) fn = 1;
         else if (hwnd == hStopBtn)  fn = 2;
-        else if (hwnd == hPrevBtn)  fn = 3;
-        else if (hwnd == hNextBtn)  fn = 4;
         if (fn >= 0) { OpenHotkeyBindDialog(NULL, fn); return 0; }
     }
     // Right-click on Repeat button: show mode picker
@@ -7708,27 +7673,15 @@ void UpdateThumbButtons()
     if (!g_pTaskbar || !g_hwnd) return;
     bool playing = (currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING);
 
-    THUMBBUTTON tb[3] = {};
-    // Prev
-    tb[0].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
-    tb[0].iId     = THUMB_BTN_PREV;
-    tb[0].hIcon   = g_thumbIcons[0];
-    wcscpy_s(tb[0].szTip, L"上一首");
-    tb[0].dwFlags = THBF_ENABLED;
+    THUMBBUTTON tb[1] = {};
     // Play/Pause — icon switches based on current play state
-    tb[1].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
-    tb[1].iId     = THUMB_BTN_PLAY;
-    tb[1].hIcon   = playing ? g_thumbIcons[2] : g_thumbIcons[1]; // ⏸ if playing, ▶ if paused/stopped
-    wcscpy_s(tb[1].szTip, playing ? L"暂停" : L"播放");
-    tb[1].dwFlags = THBF_ENABLED;
-    // Next
-    tb[2].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
-    tb[2].iId     = THUMB_BTN_NEXT;
-    tb[2].hIcon   = g_thumbIcons[3];
-    wcscpy_s(tb[2].szTip, L"下一首");
-    tb[2].dwFlags = THBF_ENABLED;
+    tb[0].dwMask  = THB_ICON | THB_TOOLTIP | THB_FLAGS;
+    tb[0].iId     = THUMB_BTN_PLAY;
+    tb[0].hIcon   = playing ? g_thumbIcons[1] : g_thumbIcons[0]; // ⏸ if playing, ▶ if paused/stopped
+    wcscpy_s(tb[0].szTip, playing ? L"暂停" : L"播放");
+    tb[0].dwFlags = THBF_ENABLED;
 
-    g_pTaskbar->ThumbBarUpdateButtons(g_hwnd, 3, tb);
+    g_pTaskbar->ThumbBarUpdateButtons(g_hwnd, 1, tb);
 }
 
 // ============================================================
@@ -9754,13 +9707,11 @@ void LayoutControls(HWND hwnd)
     // bar); Shuffle/Repeat keep the left corner. tx is recomputed from rc.right
     // on every WM_SIZE, so the group hugs the right edge while resizing.
     int bw = 32, bh = 32, bs = 6, y = m;
-    int trW = 5 * (bw + bs) - bs;              // transport group width (184)
+    int trW = 3 * (bw + bs) - bs;              // transport group width (108)
     int tx = rc.right - vw - 6 - trW;          // left x of the transport group
     MoveWindow(hPlayBtn, tx, y, bw, bh, TRUE);
     MoveWindow(hPauseBtn, tx + (bw + bs), y, bw, bh, TRUE);
     MoveWindow(hStopBtn, tx + 2 * (bw + bs), y, bw, bh, TRUE);
-    MoveWindow(hPrevBtn, tx + 3 * (bw + bs), y, bw, bh, TRUE);
-    MoveWindow(hNextBtn, tx + 4 * (bw + bs), y, bw, bh, TRUE);
     int sbx = m + 6;
     MoveWindow(hShuffleBtn, sbx, y, 46, bh, TRUE);
     MoveWindow(hRepeatBtn, sbx + 50, y, 46, bh, TRUE);
@@ -9774,14 +9725,14 @@ void LayoutControls(HWND hwnd)
             // Library/Back left of the transport group and hide by priority on a
             // narrow client — Back first (transient navigation aid), then Library.
             // An 8px gap is always kept between the groups (showMedia needs client
-            // width >= ~366px, showBack >= ~386px; the [L-11] minimum window width
+            // width >= ~290px, showBack >= ~310px; the [L-11] minimum window width
             // of 520 leaves ~500px client, so both stay visible).
             int row1Left = sbx + 50 + 46;   // right edge of repeat button
             const int kRow1Gap = 8;         // min gap kept between the two groups
             int libX = tx - kRow1Gap - 42;
-            bool showMedia = (libX >= row1Left + kRow1Gap);          // client width >= ~366
+            bool showMedia = (libX >= row1Left + kRow1Gap);          // client width >= ~290
             bool showBack  = showMedia && (g_browserActive || g_browserReturn)
-                             && (libX - 20 >= row1Left + kRow1Gap);  // client width >= ~386
+                             && (libX - 20 >= row1Left + kRow1Gap);  // client width >= ~310
             if (hBackBtn) {
                 if (showBack) {
                     MoveWindow(hBackBtn, libX - 20, y, 18, bh, TRUE);
@@ -10111,11 +10062,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         DWORD OD = WS_CHILD | WS_VISIBLE | BS_OWNERDRAW;
         HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
 
-        hPrevBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_PREV, hInst, NULL);
         hPlayBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_PLAYPAUSE, hInst, NULL);
         hPauseBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_PAUSE, hInst, NULL);
         hStopBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_STOP, hInst, NULL);
-        hNextBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_NEXT, hInst, NULL);
         hShuffleBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_SHUFFLE, hInst, NULL);
         hRepeatBtn = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_REPEAT, hInst, NULL);
         hMediaBtn     = CreateWindow(L"BUTTON", L"", OD, 0, 0, 0, 0, hwnd, (HMENU)ID_BTN_MEDIA,     hInst, NULL);
@@ -10159,8 +10108,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_OldBtnProc = (WNDPROC)SetWindowLongPtr(hPlayBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hPauseBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hStopBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hPrevBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
-        SetWindowLongPtr(hNextBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hShuffleBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hRepeatBtn, GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
         SetWindowLongPtr(hBackBtn,      GWLP_WNDPROC, (LONG_PTR)BtnHotProc);
@@ -10230,10 +10177,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         // Taskbar thumbnail toolbar (Win7+)
         g_WM_TASKBARBUTTONCREATED = RegisterWindowMessage(L"TaskbarButtonCreated");
-        g_thumbIcons[0] = CreateThumbIcon(L"\u23EE");  // ⏮ previous
-        g_thumbIcons[1] = CreateThumbIcon(L"\u25B6");  // ▶ play
-        g_thumbIcons[2] = CreateThumbIcon(L"\u23F8");  // ⏸ pause
-        g_thumbIcons[3] = CreateThumbIcon(L"\u23ED");  // ⏭ next
+        g_thumbIcons[0] = CreateThumbIcon(L"\u25B6");  // ▶ play
+        g_thumbIcons[1] = CreateThumbIcon(L"\u23F8");  // ⏸ pause
         CoCreateInstance(CLSID_TaskbarList, NULL, CLSCTX_INPROC_SERVER,
             IID_ITaskbarList3, (void**)&g_pTaskbar);
         if (g_pTaskbar) g_pTaskbar->HrInit();
@@ -10246,12 +10191,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_GETMINMAXINFO: {
         // [L-11] Enforce a minimum window size so the fixed-coordinate layouts in
         // LayoutControls never overlap or go negative: left Row-1 + Library/Back +
-        // the right-aligned transport group need ~390px client width, the seek bar /
+        // the right-aligned transport group need ~310px client width, the seek bar /
         // status-bar parts need ~200px (thresholds coordinated with the [中-20]
         // clamps); 520x360 outer size leaves
         // ~500px client width at 96 DPI — above every threshold in LayoutControls.
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 520;  // client ~500px: covers left Row-1 (106) + Library/Back + right transport (202)
+        mmi->ptMinTrackSize.x = 520;  // client ~500px: covers left Row-1 (106) + Library/Back + right transport (126)
         mmi->ptMinTrackSize.y = 360;  // keeps playlist height positive and above the status bar
         return 0;
     }
@@ -10516,11 +10461,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
 
         switch (dis->CtlID) {
-        case ID_BTN_PREV:      DrawBtn(dis, BTN_PREV);    return TRUE;
         case ID_BTN_PLAYPAUSE: DrawBtn(dis, BTN_PLAY);    return TRUE;
         case ID_BTN_PAUSE:     DrawBtn(dis, BTN_PAUSE);   return TRUE;
         case ID_BTN_STOP:      DrawBtn(dis, BTN_STOP);    return TRUE;
-        case ID_BTN_NEXT:      DrawBtn(dis, BTN_NEXT);    return TRUE;
         case ID_BTN_SHUFFLE:    DrawBtn(dis, BTN_SHUFFLE);    return TRUE;
         case ID_BTN_REPEAT:     DrawBtn(dis, BTN_REPEAT);     return TRUE;
         case ID_BTN_MEDIA:      DrawBtn(dis, BTN_MEDIA);      return TRUE;
@@ -10931,8 +10874,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case ID_BTN_PLAYPAUSE:    if (!currentStream || BASS_ChannelIsActive(currentStream) != BASS_ACTIVE_PLAYING) TogglePlayPause(); break;
         case ID_BTN_PAUSE:        if (currentStream && BASS_ChannelIsActive(currentStream) == BASS_ACTIVE_PLAYING) TogglePlayPause(); break;
         case ID_BTN_STOP:         StopAudio();       break;
-        case ID_BTN_NEXT:         PlayNext();        break;
-        case ID_BTN_PREV:         PlayPrev();        break;
         case ID_BTN_SHUFFLE:
             g_shuffle = !g_shuffle;
             CheckMenuItem(GetMenu(g_hwnd), IDM_PLAY_SHUFFLE,
@@ -11383,7 +11324,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         SmtcCleanup();
         // Release taskbar thumbnail
         if (g_pTaskbar) { g_pTaskbar->Release(); g_pTaskbar = NULL; }
-        for (int i = 0; i < 4; i++) if (g_thumbIcons[i]) { DestroyIcon(g_thumbIcons[i]); g_thumbIcons[i] = NULL; }
+        for (int i = 0; i < 2; i++) if (g_thumbIcons[i]) { DestroyIcon(g_thumbIcons[i]); g_thumbIcons[i] = NULL; }
         if (g_fontUI)   DeleteObject(g_fontUI);
         if (g_fontMono) DeleteObject(g_fontMono);
         if (g_fontBold) DeleteObject(g_fontBold);
@@ -11397,14 +11338,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     // Taskbar button created — add thumbnail toolbar buttons
     if (g_WM_TASKBARBUTTONCREATED && msg == g_WM_TASKBARBUTTONCREATED) {
         if (g_pTaskbar) {
-            THUMBBUTTON tb[3] = {};
-            tb[0].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[0].iId = THUMB_BTN_PREV;
-            tb[0].hIcon = g_thumbIcons[0]; wcscpy_s(tb[0].szTip, L"上一首"); tb[0].dwFlags = THBF_ENABLED;
-            tb[1].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[1].iId = THUMB_BTN_PLAY;
-            tb[1].hIcon = g_thumbIcons[1]; wcscpy_s(tb[1].szTip, L"播放"); tb[1].dwFlags = THBF_ENABLED;
-            tb[2].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[2].iId = THUMB_BTN_NEXT;
-            tb[2].hIcon = g_thumbIcons[3]; wcscpy_s(tb[2].szTip, L"下一首"); tb[2].dwFlags = THBF_ENABLED;
-            g_pTaskbar->ThumbBarAddButtons(hwnd, 3, tb);
+            THUMBBUTTON tb[1] = {};
+            tb[0].dwMask = THB_ICON | THB_TOOLTIP | THB_FLAGS; tb[0].iId = THUMB_BTN_PLAY;
+            tb[0].hIcon = g_thumbIcons[0]; wcscpy_s(tb[0].szTip, L"播放"); tb[0].dwFlags = THBF_ENABLED;
+            g_pTaskbar->ThumbBarAddButtons(hwnd, 1, tb);
             UpdateThumbButtons(); // set correct play/pause icon from the start
         }
         return 0;
@@ -11413,9 +11350,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     // Thumbnail toolbar button clicks (WM_COMMAND from taskbar)
     if (msg == WM_COMMAND && HIWORD(wParam) == THBN_CLICKED) {
         switch (LOWORD(wParam)) {
-        case THUMB_BTN_PREV: PlayPrev();        break;
         case THUMB_BTN_PLAY: TogglePlayPause(); break;
-        case THUMB_BTN_NEXT: PlayNext();        break;
         }
         UpdateThumbButtons();
         return 0;
@@ -11509,9 +11444,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
 
     AppendMenu(hPlay, MF_STRING, IDM_PLAY_PLAYPAUSE, L"播放 / 暂停\t空格");
     AppendMenu(hPlay, MF_STRING, IDM_PLAY_STOP,      L"停止");
-    AppendMenu(hPlay, MF_SEPARATOR, 0, NULL);
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_PREV,      L"上一首\tP");
-    AppendMenu(hPlay, MF_STRING, IDM_PLAY_NEXT,      L"下一首\tN");
     AppendMenu(hPlay, MF_SEPARATOR, 0, NULL);
     AppendMenu(hPlay, MF_STRING, IDM_PLAY_SHUFFLE,   L"随机播放\tS");
     AppendMenu(hPlay, MF_STRING, IDM_PLAY_REPEAT,    L"循环\tR");
