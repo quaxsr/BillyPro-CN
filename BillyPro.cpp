@@ -3951,15 +3951,19 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
 
     int cx = (rc.left + rc.right) / 2, cy = (rc.top + rc.bottom) / 2;
     COLORREF sym = (pressed || toggled) ? 0xFFFFFF : 0x404040;
-    int h = 4; // symbol half-size
+    // Symbol geometry scales with the button: GDI polygon drawing is vector
+    // output, so enlarged buttons stay crisp (no bitmap stretching).
+    int bh2 = rc.bottom - rc.top;
+    int h = max(4, bh2 / 4);   // symbol half-size
+    int u = max(1, h / 4);     // horizontal unit: 1 at the legacy 15px size
 
     switch (type) {
     case BTN_PREV: {
         // |< : thin bar, gap, slim triangle pointing left
-        RECT bar = { cx - 5, cy - h, cx - 4, cy + h + 1 };
+        RECT bar = { cx - 5 * u, cy - h, cx - 4 * u, cy + h + 1 };
         HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &bar, b); DeleteObject(b);
         // slim triangle: narrow width relative to height
-        POINT p[3] = { {cx + 2,cy - h},{cx + 2,cy + h},{cx - 2,cy} };
+        POINT p[3] = { {cx + 2 * u,cy - h},{cx + 2 * u,cy + h},{cx - 2 * u,cy} };
         HBRUSH tb = CreateSolidBrush(sym); HPEN tp = CreatePen(PS_SOLID, 1, sym);
         HBRUSH ob = (HBRUSH)SelectObject(dc, tb); HPEN op = (HPEN)SelectObject(dc, tp);
         Polygon(dc, p, 3);
@@ -3968,7 +3972,7 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
     }
     case BTN_PLAY: {
         // Same size as other symbols - simple right triangle, h=4 like rest
-        POINT p[3] = { {cx - 3, cy - h}, {cx - 3, cy + h}, {cx + h, cy} };
+        POINT p[3] = { {cx - 3 * u, cy - h}, {cx - 3 * u, cy + h}, {cx + h, cy} };
         HBRUSH tb = CreateSolidBrush(sym); HPEN tp = CreatePen(PS_SOLID, 1, sym);
         HBRUSH ob = (HBRUSH)SelectObject(dc, tb); HPEN op = (HPEN)SelectObject(dc, tp);
         Polygon(dc, p, 3);
@@ -3976,22 +3980,22 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         break;
     }
     case BTN_PAUSE: {
-        RECT r1 = { cx - 4,cy - h,cx - 1,cy + h + 1 }, r2 = { cx + 1,cy - h,cx + 4,cy + h + 1 };
+        RECT r1 = { cx - 4 * u,cy - h,cx - u,cy + h + 1 }, r2 = { cx + u,cy - h,cx + 4 * u,cy + h + 1 };
         HBRUSH pb = CreateSolidBrush(sym);
         FillRect(dc, &r1, pb); FillRect(dc, &r2, pb); DeleteObject(pb);
         break;
     }
     case BTN_STOP:
-    { RECT sq = { cx - 4, cy - 4, cx + 4, cy + 5 }; HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &sq, b); DeleteObject(b); }
+    { RECT sq = { cx - h, cy - h, cx + h, cy + h + 1 }; HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &sq, b); DeleteObject(b); }
     break;
     case BTN_NEXT: {
         // >| : slim triangle pointing right, gap, thin bar
-        POINT p[3] = { {cx - 2,cy - h},{cx - 2,cy + h},{cx + 2,cy} };
+        POINT p[3] = { {cx - 2 * u,cy - h},{cx - 2 * u,cy + h},{cx + 2 * u,cy} };
         HBRUSH tb = CreateSolidBrush(sym); HPEN tp = CreatePen(PS_SOLID, 1, sym);
         HBRUSH ob = (HBRUSH)SelectObject(dc, tb); HPEN op = (HPEN)SelectObject(dc, tp);
         Polygon(dc, p, 3);
         SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(tb); DeleteObject(tp);
-        RECT bar = { cx + 4, cy - h, cx + 5, cy + h + 1 };
+        RECT bar = { cx + 4 * u, cy - h, cx + 5 * u, cy + h + 1 };
         HBRUSH b = CreateSolidBrush(sym); FillRect(dc, &bar, b); DeleteObject(b);
         break;
     }
@@ -4007,7 +4011,8 @@ static void DrawBtn(DRAWITEMSTRUCT* dis, BtnType type)
         Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
         SelectObject(dc, sop); DeleteObject(spn);
         SetBkMode(dc, TRANSPARENT); SetTextColor(dc, sym);
-        HFONT hf = CreateFont(-10, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+        int fs = -max(10, (bh2 * 14) / 30);   // text scales with the button height
+        HFONT hf = CreateFont(fs, 0, 0, 0, FW_NORMAL, 0, 0, 0,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
         HFONT of = (HFONT)SelectObject(dc, hf);
@@ -9743,37 +9748,40 @@ void LayoutControls(HWND hwnd)
     int sbh = rcs.bottom - rcs.top;
 
     int m = 4;
-
-    // Row 1: tiny compact buttons
-    int bw = 14, bh = 15, bs = 4, y = m;
-    MoveWindow(hPlayBtn, m, y, bw, bh, TRUE);
-    MoveWindow(hPauseBtn, m + (bw + bs), y, bw, bh, TRUE);
-    MoveWindow(hStopBtn, m + 2 * (bw + bs), y, bw, bh, TRUE);
-    MoveWindow(hPrevBtn, m + 3 * (bw + bs), y, bw, bh, TRUE);
-    MoveWindow(hNextBtn, m + 4 * (bw + bs), y, bw, bh, TRUE);
-    int sbx = m + 5 * (bw + bs) + 6;
-    MoveWindow(hShuffleBtn, sbx, y, 46, bh, TRUE);
-    MoveWindow(hRepeatBtn, sbx + 50, y, 46, bh, TRUE);
-    // Row 2: seek bar
     int vw = 12;  // vol bar width
 
-    // Library button: far right, next to vol bar — only visible when media folders are set
-    // Back button: to the left of Library, only when browser is active
+    // Row 1: transport buttons enlarged and right-aligned (clear of the volume
+    // bar); Shuffle/Repeat keep the left corner. tx is recomputed from rc.right
+    // on every WM_SIZE, so the group hugs the right edge while resizing.
+    int bw = 32, bh = 32, bs = 6, y = m;
+    int trW = 5 * (bw + bs) - bs;              // transport group width (184)
+    int tx = rc.right - vw - 6 - trW;          // left x of the transport group
+    MoveWindow(hPlayBtn, tx, y, bw, bh, TRUE);
+    MoveWindow(hPauseBtn, tx + (bw + bs), y, bw, bh, TRUE);
+    MoveWindow(hStopBtn, tx + 2 * (bw + bs), y, bw, bh, TRUE);
+    MoveWindow(hPrevBtn, tx + 3 * (bw + bs), y, bw, bh, TRUE);
+    MoveWindow(hNextBtn, tx + 4 * (bw + bs), y, bw, bh, TRUE);
+    int sbx = m + 6;
+    MoveWindow(hShuffleBtn, sbx, y, 46, bh, TRUE);
+    MoveWindow(hRepeatBtn, sbx + 50, y, 46, bh, TRUE);
+
+    // Library button: just left of the transport group — only visible when media
+    // folders are set. Back button: to the left of Library, only in browser mode.
     if (hMediaBtn) {
         if (!g_mediaFolders.empty()) {
-            // [中-20] Row-1's fixed segment ends at row1Right (repeat button) while the
-            // Library/Back buttons are placed back from rc.right; on a very narrow client
-            // the two groups would overlap or the right group would land at a negative x.
-            // Hide by priority instead: Back first (transient navigation aid), then Library.
-            // Thresholds are conservative — an 8px gap is always kept between the groups
-            // (showMedia needs client width >= ~262px, showBack >= ~282px; the [L-11]
-            // minimum window width of 520 leaves ~500px client, so both stay visible).
-            int row1Right = sbx + 50 + 46;  // right edge of repeat button (fixed x = 196)
+            // [中-20] Row-1's left segment (Shuffle/Repeat, ends at row1Left) and the
+            // right segment (Library/Back + transport) must never overlap: place
+            // Library/Back left of the transport group and hide by priority on a
+            // narrow client — Back first (transient navigation aid), then Library.
+            // An 8px gap is always kept between the groups (showMedia needs client
+            // width >= ~366px, showBack >= ~386px; the [L-11] minimum window width
+            // of 520 leaves ~500px client, so both stay visible).
+            int row1Left = sbx + 50 + 46;   // right edge of repeat button
             const int kRow1Gap = 8;         // min gap kept between the two groups
-            int libX = rc.right - vw - 4 - 42;
-            bool showMedia = (libX >= row1Right + kRow1Gap);         // client width >= ~262
+            int libX = tx - kRow1Gap - 42;
+            bool showMedia = (libX >= row1Left + kRow1Gap);          // client width >= ~366
             bool showBack  = showMedia && (g_browserActive || g_browserReturn)
-                             && (libX - 20 >= row1Right + kRow1Gap); // client width >= ~282
+                             && (libX - 20 >= row1Left + kRow1Gap);  // client width >= ~386
             if (hBackBtn) {
                 if (showBack) {
                     MoveWindow(hBackBtn, libX - 20, y, 18, bh, TRUE);
@@ -10237,12 +10245,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     case WM_GETMINMAXINFO: {
         // [L-11] Enforce a minimum window size so the fixed-coordinate layouts in
-        // LayoutControls never overlap or go negative: Row-1 buttons + Library/Back
-        // need ~282px client width, the seek bar / status-bar parts need ~200px
-        // (thresholds coordinated with the [中-20] clamps); 520x360 outer size leaves
+        // LayoutControls never overlap or go negative: left Row-1 + Library/Back +
+        // the right-aligned transport group need ~390px client width, the seek bar /
+        // status-bar parts need ~200px (thresholds coordinated with the [中-20]
+        // clamps); 520x360 outer size leaves
         // ~500px client width at 96 DPI — above every threshold in LayoutControls.
         MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-        mmi->ptMinTrackSize.x = 520;  // client ~500px: covers Row-1 (196) + gap + right group (~282 needed)
+        mmi->ptMinTrackSize.x = 520;  // client ~500px: covers left Row-1 (106) + Library/Back + right transport (202)
         mmi->ptMinTrackSize.y = 360;  // keeps playlist height positive and above the status bar
         return 0;
     }
