@@ -1,18 +1,23 @@
-# BillyPro — GitHub 云端编译
+# BillyPro-CN 🎵 (基于 C++ Win32 原生魔改)
 
-本文件夹只包含云端编译所需的文件。把**全部内容**（包括 `.github` 隐藏文件夹）上传到 GitHub 仓库，Actions 会自动编译出 64 位的 `BillyPro.exe`。
+这是一个基于开源项目进行**极度深度魔改与裁剪**的 Windows 原生桌面音频推流工具。
+专为游戏玩家打造，对标 `Soundpad`，让你在游戏中轻松给队友播放音乐或音效。
 
-## 步骤
+ ✨ 核心特性
+*   **纯 C++ 原生极简架构**：使用 C++ (Win32 API) 编写，砍掉了原版 1500+ 行冗余代码（录音/转换/低频UI等），核心代码高度集中在单文件 `BillyPro.cpp` 中，轻量且运行极快。
+*   **无视反作弊的全局热键**：彻底抛弃了极易被 Vanguard 拦截的传统键盘 Hook，重构为 **Raw Input (`WM_INPUT`) 硬件级监听**。配合自动 UAC 提权，完美实现在《无畏契约》等严苛反作弊游戏内的全局快捷键穿透。
+*   **虚拟麦克风推流**：配合虚拟声卡（如 `VB-CABLE`），将音频直接混入麦克风通道，让你的队友在游戏内清晰听到音乐。
 
-1. 注册/登录 [GitHub](https://github.com)，右上角 **+** → **New repository**（Public 或 Private 均可；私有仓库免费账户每月 2000 分钟额度，本项目一次编译约 1～2 分钟）
-2. 进入新建的空仓库，点 **uploading an existing file**，把本文件夹里的所有内容（含 `.github` 文件夹）一起拖进去 → **Commit changes**
-3. 打开仓库的 **Actions** 标签页，会看到 "Build BillyPro" 正在运行（推送后自动触发，也可手动 **Run workflow**）
-4. 运行出现绿勾后，进入该次运行详情页，底部 **Artifacts** 下载 `BillyPro-x64`
-5. 解压得到 `BillyPro.exe`，与 **64 位** 的 `bass.dll` 放在同一目录即可运行
+下载与安装
+1. 点击页面顶部的 **Actions** 标签页。
+2. 选择最新一次成功构建（带有绿色对勾 ✅）的 workflow。
+3. 在页面底部找到 **Artifacts**，点击 `BillyPro-x64` 下载压缩包。
+4. 解压后，双击 `BillyPro.exe` 即可运行。
 
-## 说明
+🙏 致谢
+本项目的诞生离不开前人的栽树。本项目基于以下优秀开源项目进行中文本地化与深度魔改：
+原作者项目：[bisoloc/BillyPro](https://github.com/bisoloc/BillyPro) 
 
-- 编译配置：`Release | x64`（`bass.lib` 为 64 位导入库；vcxproj 的 Win32 配置未链接 bass.lib，勿用）
-- `bass.dll` 运行时才需要，请从 [un4seen.com](https://www.un4seen.com/) 获取 x64 版，与 exe 同目录
-- `dca_context.h` / `dca_frame.h` 取自 dcadec 源码（原 `dcadec_src.zip`），仅供 `BillyPro.cpp` 编译期引用
-- 如果 Actions 报 msbuild 找不到工具集，可在 Build 步骤后追加参数 `/p:PlatformToolset=v143` 降级到 VS2022 工具集再试
+感谢原作者的开源精神！
+---
+*Disclaimer: 本软件仅供个人学习与游戏娱乐使用，请勿用于商业用途。*
