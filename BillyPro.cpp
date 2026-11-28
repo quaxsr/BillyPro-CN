@@ -1,4 +1,4 @@
-﻿// BillyPro.cpp  -  Win32 + BASS audio player  v0.9
+// BillyPro.cpp  -  Win32 + BASS audio player  v0.9
 // Compile:
 //   cl BillyPro.cpp /W3 /O2 /link bass.lib User32.lib Gdi32.lib
 //          Comctl32.lib Shell32.lib Ole32.lib Winmm.lib Uxtheme.lib
@@ -11364,6 +11364,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 // ============================================================
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow)
 {
+    // UAC 提权：如果非管理员，以管理员权限重启当前进程
+    if (!IsUserAnAdmin()) {
+        wchar_t exePath[MAX_PATH];
+        GetModuleFileName(NULL, exePath, MAX_PATH);
+        SHELLEXECUTEINFO sei = { sizeof(sei) };
+        sei.lpVerb = L"runas";
+        sei.lpFile = exePath;
+        sei.hwnd = NULL;
+        sei.nShow = SW_NORMAL;
+        if (!ShellExecuteEx(&sei)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_CANCELLED) {
+                // 用户拒绝提权，正常退出
+                return 0;
+            }
+        }
+        // 提权启动成功，当前进程退出
+        return 0;
+    }
+
     // Load multi-instance preference from INI before the mutex check
     // Must use the same path as GetIniPath() — %APPDATA%\BillyPro\BillyPro.ini
     bool multiInstPref = false;
